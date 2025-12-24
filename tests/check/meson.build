@@ -25,6 +25,7 @@ gst_tests = [
 if SOC == 'am62a'
   gst_tests += [
     ['gsttiovxisp', true, [gst_internal_dep],  [] ],
+    ['gsttiovxfc', true, [gst_internal_dep],  [] ],
   ]
 endif
 
