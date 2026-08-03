@@ -65,15 +65,21 @@
 
 #include <gst/gst.h>
 
+#ifndef SOC_AM62D
 #include "gstticolorconvert.h"
 #include "gsttiscaler.h"
 #include "gsttiperfoverlay.h"
 #include "gsttimosaic.h"
+#endif
 
 #if defined(DL_PLUGINS)
 #include "gsttidlpreproc.h"
 #include "gsttidlinferer.h"
 #include "gsttidlpostproc.h"
+#endif
+
+#if defined(TVM_PLUGINS)
+#include "gsttitvm.h"
 #endif
 
 /* entry point to initialize the plug-in
@@ -85,6 +91,7 @@ ti_init (GstPlugin * plugin)
 {
   gboolean ret = FALSE;
 
+#ifndef SOC_AM62D
   ret = gst_element_register (plugin, "ticolorconvert", GST_RANK_NONE,
       GST_TYPE_TI_COLOR_CONVERT);
   if (!ret) {
@@ -112,7 +119,7 @@ ti_init (GstPlugin * plugin)
     GST_ERROR ("Failed to register the timosaic element");
     goto out;
   }
-
+#endif
 #if defined(DL_PLUGINS)
   ret = gst_element_register (plugin, "tidlpreproc", GST_RANK_NONE,
       GST_TYPE_TI_DL_PRE_PROC);
@@ -120,7 +127,8 @@ ti_init (GstPlugin * plugin)
     GST_ERROR ("Failed to register the tidlpreproc element");
     goto out;
   }
-
+#endif
+#ifndef SOC_AM62D
   ret = gst_element_register (plugin, "tidlinferer", GST_RANK_NONE,
       GST_TYPE_TI_DL_INFERER);
   if (!ret) {
@@ -132,6 +140,15 @@ ti_init (GstPlugin * plugin)
       GST_TYPE_TI_DL_POST_PROC);
   if (!ret) {
     GST_ERROR ("Failed to register the tidlpostproc element");
+    goto out;
+  }
+#endif
+
+
+#if defined(TVM_PLUGINS)
+  ret = gst_element_register (plugin, "titvm", GST_RANK_NONE, GST_TYPE_TI_TVM);
+  if (!ret) {
+    GST_ERROR ("Failed to register the titvm element");
     goto out;
   }
 #endif
