@@ -67,6 +67,10 @@
 #include <gst/gst.h>
 #include <gst/base/gstbasetransform.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 G_BEGIN_DECLS
 
 /* Element type macros */
@@ -103,6 +107,10 @@ struct _GstTiTvm
     gchar *model_path;            /* Path to TVM artifacts directory */
     gint iterations;              /* Number of inference iterations */
     gboolean benchmark;           /* Enable performance benchmarking */
+    gboolean audio_mode;          /* Enable audio enhancement mode (deinterleave/interleave) */
+    gchar *rproc_device;          /* Remoteproc device for RPMsg */
+    guint rproc_id;               /* Remote processor core ID (8 = C7x_0 on AM62D) */
+    guint remote_ep;              /* RPMsg endpoint number */
 
     /* TVM runtime state */
     gboolean tvm_initialized;     /* TVM runtime initialization status */
@@ -110,6 +118,14 @@ struct _GstTiTvm
     void *set_input_func;         /* TVM set_input function */
     void *run_func;               /* TVM run function */
     void *get_output_func;        /* TVM get_output function */
+
+    /* Audio mode: RPMsg context and DMA buffers */
+    void *rpmsg_ctx;              /* Shared RPMsg context (GstTiRpmsgCtx*) */
+    void *dma_input;              /* DMA buffer for interleaved input (struct dma_buf_params*) */
+    void *dma_deint;              /* DMA buffer for deinterleaved data (struct dma_buf_params*) */
+    void *dma_inter;              /* DMA buffer for interleaved output (struct dma_buf_params*) */
+    gboolean dma_allocated;       /* DMA buffers allocated flag */
+    guint32 sequence_number;      /* RPMsg sequence number */
 
     /* Input/output data */
     void *final_output;           /* Final inference output buffer */
@@ -137,14 +153,29 @@ enum
     PROP_0,
     PROP_MODEL_PATH,
     PROP_ITERATIONS,
-    PROP_BENCHMARK
+    PROP_BENCHMARK,
+    PROP_AUDIO_MODE,
+    PROP_RPROC_DEVICE,
+    PROP_RPROC_ID,
+    PROP_REMOTE_EP
 };
 
 /* Default values */
 #define DEFAULT_MODEL_PATH ""
 #define DEFAULT_ITERATIONS 1
 #define DEFAULT_BENCHMARK TRUE
+#define DEFAULT_AUDIO_MODE FALSE
+#define DEFAULT_RPROC_DEVICE "/dev/remoteproc0"
+#define DEFAULT_RPROC_ID 8
+#define DEFAULT_REMOTE_EP 13
+
+/* Audio mode DMA buffer sizes (for 401 frames × 161 bins × 2 channels × float) */
+#define TVM_AUDIO_BUFFER_SIZE 516488  /* 401 * 161 * 2 * 4 bytes */
 
 G_END_DECLS
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* __GST_TI_TVM_H__ */

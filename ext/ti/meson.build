@@ -29,6 +29,13 @@ if get_option('tvm-plugins').enabled() and get_option('enable-tvm')
   ]
 endif
 
+if get_option('stft-plugins').enabled()
+  gst_ti_plugin_sources += [
+    'gsttirpmsgctx.cpp',
+    'gstdspkernel.cpp',
+  ]
+endif
+
 gst_ti_plugin_headers = []
 
 if host_soc != 'am62d'
@@ -51,6 +58,13 @@ endif
 if get_option('tvm-plugins').enabled() and get_option('enable-tvm')
   gst_ti_plugin_headers += [
     'gsttitvm.h',
+  ]
+endif
+
+if get_option('stft-plugins').enabled()
+  gst_ti_plugin_headers += [
+    'gsttirpmsgctx.h',
+    'gstdspkernel.h',
   ]
 endif
 

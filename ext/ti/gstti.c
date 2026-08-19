@@ -82,6 +82,10 @@
 #include "gsttitvm.h"
 #endif
 
+#if defined(STFT_PLUGINS)
+#include "gstdspkernel.h"
+#endif
+
 /* entry point to initialize the plug-in
  * initialize the plug-in itself
  * register the element factories and other features
@@ -149,6 +153,16 @@ ti_init (GstPlugin * plugin)
   ret = gst_element_register (plugin, "titvm", GST_RANK_NONE, GST_TYPE_TI_TVM);
   if (!ret) {
     GST_ERROR ("Failed to register the titvm element");
+    goto out;
+  }
+#endif
+
+#if defined(STFT_PLUGINS)
+  ret =
+      gst_element_register (plugin, "tidspkernel", GST_RANK_NONE,
+      GST_TYPE_DSP_KERNEL);
+  if (!ret) {
+    GST_ERROR ("Failed to register the tidspkernel element");
     goto out;
   }
 #endif
