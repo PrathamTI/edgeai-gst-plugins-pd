@@ -89,9 +89,9 @@ using namespace
     tvm::runtime;
 
 /* RPMsg message types for audio mode */
-#define C7X_MSG_DEINTERLEAVE      0x1010
-#define C7X_MSG_DEINTERLEAVE_RESP 0x2010
-#define C7X_MSG_INTERLEAVE        0x1040
+#define C7X_MSG_DEINTERLEAVE      0x1040        // Same message type for both operations
+#define C7X_MSG_DEINTERLEAVE_RESP 0x2040
+#define C7X_MSG_INTERLEAVE        0x1040        // flag parameter differentiates
 #define C7X_MSG_INTERLEAVE_RESP   0x2040
 #define C7X_STATUS_SUCCESS        0
 
@@ -116,7 +116,11 @@ struct audio_msg
   uint32_t
       output_buffer;
   uint32_t
-      data_size;
+      input_frame;              // Number of frames (401 for GCRN)
+  uint32_t
+      fft_size;                 // FFT size (320 for GCRN)
+  uint32_t
+      flag;                     // 0=deinterleave, 1=interleave
 } __attribute__((packed));
 
 GST_DEBUG_CATEGORY_STATIC (gst_ti_tvm_debug_category);
@@ -233,12 +237,18 @@ gst_ti_tvm_class_init (GstTiTvmClass * klass)
   base_transform_class->prepare_output_buffer =
       GST_DEBUG_FUNCPTR (gst_ti_tvm_prepare_output_buffer);
 
-  base_transform_class->passthrough_on_same_caps = TRUE;
+  base_transform_class->passthrough_on_same_caps = FALSE;
 
   /* Properties */
   g_object_class_install_property (gobject_class, PROP_MODEL_PATH,
       g_param_spec_string ("model-path", "Model Path",
           "Path to TVM artifacts directory", DEFAULT_MODEL_PATH,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property (gobject_class, PROP_INPUT_SHAPE,
+      g_param_spec_string ("input-shape", "Input Shape",
+          "Input tensor shape as comma-separated dimensions (e.g., \"1,2,401,161\")",
+          DEFAULT_INPUT_SHAPE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_ITERATIONS,
@@ -280,6 +290,7 @@ static void
 gst_ti_tvm_init (GstTiTvm * tvm)
 {
   tvm->model_path = g_strdup (DEFAULT_MODEL_PATH);
+  tvm->input_shape = g_strdup (DEFAULT_INPUT_SHAPE);
   tvm->iterations = DEFAULT_ITERATIONS;
   tvm->benchmark = DEFAULT_BENCHMARK;
   tvm->audio_mode = DEFAULT_AUDIO_MODE;
@@ -322,6 +333,10 @@ gst_ti_tvm_set_property (GObject * object, guint property_id,
       g_free (tvm->model_path);
       tvm->model_path = g_value_dup_string (value);
       break;
+    case PROP_INPUT_SHAPE:
+      g_free (tvm->input_shape);
+      tvm->input_shape = g_value_dup_string (value);
+      break;
     case PROP_ITERATIONS:
       tvm->iterations = g_value_get_int (value);
       break;
@@ -359,6 +374,9 @@ gst_ti_tvm_get_property (GObject * object, guint property_id,
   switch (property_id) {
     case PROP_MODEL_PATH:
       g_value_set_string (value, tvm->model_path);
+      break;
+    case PROP_INPUT_SHAPE:
+      g_value_set_string (value, tvm->input_shape);
       break;
     case PROP_ITERATIONS:
       g_value_set_int (value, tvm->iterations);
@@ -400,6 +418,7 @@ gst_ti_tvm_finalize (GObject * object)
       tvm = GST_TI_TVM (object);
 
   g_free (tvm->model_path);
+  g_free (tvm->input_shape);
   g_free (tvm->rproc_device);
 
   if (tvm->perf_data.inference_times) {
@@ -410,12 +429,10 @@ gst_ti_tvm_finalize (GObject * object)
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
-static
-    gboolean
+static gboolean
 gst_ti_tvm_start (GstBaseTransform * trans)
 {
-  GstTiTvm *
-      tvm = GST_TI_TVM (trans);
+  GstTiTvm *tvm = GST_TI_TVM (trans);
 
   GST_DEBUG_OBJECT (tvm, "Starting TI TVM inference element");
   g_print ("TI TVM Inference Element\n");
@@ -448,14 +465,11 @@ gst_ti_tvm_start (GstBaseTransform * trans)
     tvm->dma_deint = g_new0 (struct dma_buf_params, 1);
     tvm->dma_inter = g_new0 (struct dma_buf_params, 1);
 
-    int
-        r1 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
+    int r1 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
         tvm->rproc_device, (struct dma_buf_params *) tvm->dma_input);
-    int
-        r2 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
+    int r2 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
         tvm->rproc_device, (struct dma_buf_params *) tvm->dma_deint);
-    int
-        r3 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
+    int r3 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
         tvm->rproc_device, (struct dma_buf_params *) tvm->dma_inter);
 
     if (r1 != 0 || r2 != 0 || r3 != 0) {
@@ -484,12 +498,10 @@ gst_ti_tvm_start (GstBaseTransform * trans)
   return TRUE;
 }
 
-static
-    gboolean
+static gboolean
 gst_ti_tvm_stop (GstBaseTransform * trans)
 {
-  GstTiTvm *
-      tvm = GST_TI_TVM (trans);
+  GstTiTvm *tvm = GST_TI_TVM (trans);
 
   GST_DEBUG_OBJECT (tvm, "Stopping TI TVM inference element");
 
@@ -542,14 +554,12 @@ static GstCaps *
 gst_ti_tvm_transform_caps (GstBaseTransform * trans, GstPadDirection direction,
     GstCaps * caps, GstCaps * filter)
 {
-  GstCaps *
-      othercaps;
+  GstCaps *othercaps;
 
   othercaps = gst_caps_new_simple ("application/octet-stream", NULL, NULL);
 
   if (filter) {
-    GstCaps *
-        intersect = gst_caps_intersect_full (othercaps, filter,
+    GstCaps *intersect = gst_caps_intersect_full (othercaps, filter,
         GST_CAPS_INTERSECT_FIRST);
     gst_caps_unref (othercaps);
     othercaps = intersect;
@@ -559,13 +569,11 @@ gst_ti_tvm_transform_caps (GstBaseTransform * trans, GstPadDirection direction,
 }
 
 /* Prepare output buffer with correct size */
-static
-    GstFlowReturn
+static GstFlowReturn
 gst_ti_tvm_prepare_output_buffer (GstBaseTransform * trans, GstBuffer * inbuf,
     GstBuffer ** outbuf)
 {
-  GstTiTvm *
-      tvm = GST_TI_TVM (trans);
+  GstTiTvm *tvm = GST_TI_TVM (trans);
   gsize output_size;
 
   /* If we already know the output size from previous inference, use it */
@@ -595,17 +603,13 @@ gst_ti_tvm_prepare_output_buffer (GstBaseTransform * trans, GstBuffer * inbuf,
 }
 
 /* Audio mode helper: Deinterleave complex spectral data via C7x DSP */
-static
-    gboolean
+static gboolean
 gst_ti_tvm_deinterleave_audio (GstTiTvm * tvm, const guint8 * interleaved_data,
     gsize data_size, guint8 ** deinterleaved_out)
 {
-  struct dma_buf_params *
-      dma_in = (struct dma_buf_params *) tvm->dma_input;
-  struct dma_buf_params *
-      dma_out = (struct dma_buf_params *) tvm->dma_deint;
-  GstTiRpmsgChan *
-      ctx = (GstTiRpmsgChan *) tvm->rpmsg_ctx;
+  struct dma_buf_params *dma_in = (struct dma_buf_params *) tvm->dma_input;
+  struct dma_buf_params *dma_out = (struct dma_buf_params *) tvm->dma_deint;
+  GstTiRpmsgChan *ctx = (GstTiRpmsgChan *) tvm->rpmsg_ctx;
 
   /* Copy interleaved data to input DMA buffer */
   dmabuf_sync (dma_in->dma_buf_fd, DMA_BUF_SYNC_START);
@@ -613,15 +617,21 @@ gst_ti_tvm_deinterleave_audio (GstTiTvm * tvm, const guint8 * interleaved_data,
   dmabuf_sync (dma_in->dma_buf_fd, DMA_BUF_SYNC_END);
 
   /* Send deinterleave request to C7x */
-  struct audio_msg
-  req = { };
+  struct audio_msg req = { };
   req.hdr.type = C7X_MSG_DEINTERLEAVE;
   req.hdr.seq = tvm->sequence_number++;
   req.hdr.len = sizeof (req);
   req.hdr.status = 0;
   req.input_buffer = (uint32_t) dma_in->phys_addr;
   req.output_buffer = (uint32_t) dma_out->phys_addr;
-  req.data_size = (uint32_t) data_size;
+  req.input_frame = 401;        // GCRN_TOTAL_FRAMES
+  req.fft_size = 320;           // GCRN_FFT_SIZE
+  req.flag = 0;                 // 0 = deinterleave
+
+  GST_DEBUG_OBJECT (tvm,
+      "[RPMsg] Sending DEINTERLEAVE: seq=%d frames=%u fft_size=%u flag=%u in=0x%x out=0x%x",
+      req.hdr.seq, req.input_frame, req.fft_size, req.flag, req.input_buffer,
+      req.output_buffer);
 
   if (send_msg (ctx->fd, (char *) &req, sizeof (req)) < 0) {
     GST_ERROR_OBJECT (tvm, "send_msg DEINTERLEAVE failed");
@@ -629,14 +639,16 @@ gst_ti_tvm_deinterleave_audio (GstTiTvm * tvm, const guint8 * interleaved_data,
   }
 
   /* Receive response */
-  struct audio_msg
-  resp = { };
-  int
-      resp_len = sizeof (resp);
+  struct audio_msg resp = { };
+  int resp_len = sizeof (resp);
   if (recv_msg (ctx->fd, sizeof (resp), (char *) &resp, &resp_len) < 0) {
     GST_ERROR_OBJECT (tvm, "recv_msg DEINTERLEAVE_RESP failed");
     return FALSE;
   }
+
+  GST_DEBUG_OBJECT (tvm,
+      "[RPMsg] Received DEINTERLEAVE_RESP: type=0x%x status=%d", resp.hdr.type,
+      resp.hdr.status);
 
   if (resp.hdr.type != C7X_MSG_DEINTERLEAVE_RESP
       || resp.hdr.status != C7X_STATUS_SUCCESS) {
@@ -655,17 +667,13 @@ gst_ti_tvm_deinterleave_audio (GstTiTvm * tvm, const guint8 * interleaved_data,
 }
 
 /* Audio mode helper: Interleave complex spectral data via C7x DSP */
-static
-    gboolean
+static gboolean
 gst_ti_tvm_interleave_audio (GstTiTvm * tvm, const guint8 * deinterleaved_data,
     gsize data_size, guint8 ** interleaved_out)
 {
-  struct dma_buf_params *
-      dma_in = (struct dma_buf_params *) tvm->dma_deint;
-  struct dma_buf_params *
-      dma_out = (struct dma_buf_params *) tvm->dma_inter;
-  GstTiRpmsgChan *
-      ctx = (GstTiRpmsgChan *) tvm->rpmsg_ctx;
+  struct dma_buf_params *dma_in = (struct dma_buf_params *) tvm->dma_deint;
+  struct dma_buf_params *dma_out = (struct dma_buf_params *) tvm->dma_inter;
+  GstTiRpmsgChan *ctx = (GstTiRpmsgChan *) tvm->rpmsg_ctx;
 
   /* Copy deinterleaved data to input DMA buffer */
   dmabuf_sync (dma_in->dma_buf_fd, DMA_BUF_SYNC_START);
@@ -673,15 +681,21 @@ gst_ti_tvm_interleave_audio (GstTiTvm * tvm, const guint8 * deinterleaved_data,
   dmabuf_sync (dma_in->dma_buf_fd, DMA_BUF_SYNC_END);
 
   /* Send interleave request to C7x */
-  struct audio_msg
-  req = { };
+  struct audio_msg req = { };
   req.hdr.type = C7X_MSG_INTERLEAVE;
   req.hdr.seq = tvm->sequence_number++;
   req.hdr.len = sizeof (req);
   req.hdr.status = 0;
   req.input_buffer = (uint32_t) dma_in->phys_addr;
   req.output_buffer = (uint32_t) dma_out->phys_addr;
-  req.data_size = (uint32_t) data_size;
+  req.input_frame = 401;        // GCRN_TOTAL_FRAMES
+  req.fft_size = 320;           // GCRN_FFT_SIZE
+  req.flag = 1;                 // 1 = interleave
+
+  GST_DEBUG_OBJECT (tvm,
+      "[RPMsg] Sending INTERLEAVE: seq=%d frames=%u fft_size=%u flag=%u in=0x%x out=0x%x",
+      req.hdr.seq, req.input_frame, req.fft_size, req.flag, req.input_buffer,
+      req.output_buffer);
 
   if (send_msg (ctx->fd, (char *) &req, sizeof (req)) < 0) {
     GST_ERROR_OBJECT (tvm, "send_msg INTERLEAVE failed");
@@ -689,14 +703,16 @@ gst_ti_tvm_interleave_audio (GstTiTvm * tvm, const guint8 * deinterleaved_data,
   }
 
   /* Receive response */
-  struct audio_msg
-  resp = { };
-  int
-      resp_len = sizeof (resp);
+  struct audio_msg resp = { };
+  int resp_len = sizeof (resp);
   if (recv_msg (ctx->fd, sizeof (resp), (char *) &resp, &resp_len) < 0) {
     GST_ERROR_OBJECT (tvm, "recv_msg INTERLEAVE_RESP failed");
     return FALSE;
   }
+
+  GST_DEBUG_OBJECT (tvm,
+      "[RPMsg] Received INTERLEAVE_RESP: type=0x%x status=%d", resp.hdr.type,
+      resp.hdr.status);
 
   if (resp.hdr.type != C7X_MSG_INTERLEAVE_RESP
       || resp.hdr.status != C7X_STATUS_SUCCESS) {
@@ -714,13 +730,11 @@ gst_ti_tvm_interleave_audio (GstTiTvm * tvm, const guint8 * deinterleaved_data,
   return TRUE;
 }
 
-static
-    GstFlowReturn
+static GstFlowReturn
 gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     GstBuffer * outbuf)
 {
-  GstTiTvm *
-      tvm = GST_TI_TVM (trans);
+  GstTiTvm *tvm = GST_TI_TVM (trans);
   GstMapInfo in_map, out_map;
   GstFlowReturn ret;
 
@@ -730,21 +744,33 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     return GST_FLOW_ERROR;
   }
 
-  gfloat *
-      input_data = NULL;
+  GST_DEBUG_OBJECT (tvm, "transform: input buffer size=%zu bytes", in_map.size);
+
+  /* Handle empty buffers (STFT accumulation phase) - pass through immediately */
+  if (in_map.size == 0) {
+    GST_DEBUG_OBJECT (tvm, "Empty buffer, passing through");
+    gst_buffer_unmap (inbuf, &in_map);
+    gst_buffer_set_size (outbuf, 0);
+    return GST_FLOW_OK;
+  }
+
+  gfloat *input_data = NULL;
   gsize input_size = 0;
-  guint8 *
-      deinterleaved_data = NULL;
+  guint8 *deinterleaved_data = NULL;
   gboolean need_free_deint = FALSE;
 
   /* Audio mode: deinterleave first */
   if (tvm->audio_mode) {
+    GST_INFO_OBJECT (tvm,
+        "[AUDIO MODE] Deinterleaving %zu bytes before TVM inference",
+        in_map.size);
     if (!gst_ti_tvm_deinterleave_audio (tvm, in_map.data, in_map.size,
             &deinterleaved_data)) {
       GST_ERROR_OBJECT (tvm, "Deinterleave failed");
       gst_buffer_unmap (inbuf, &in_map);
       return GST_FLOW_ERROR;
     }
+    GST_INFO_OBJECT (tvm, "[AUDIO MODE] Deinterleave complete");
     input_data = (gfloat *) deinterleaved_data;
     input_size = in_map.size / sizeof (gfloat);
     need_free_deint = TRUE;
@@ -761,8 +787,7 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
 
   /* Copy inference output to output buffer */
   if (ret == GST_FLOW_OK && tvm->final_output && tvm->output_num_floats > 0) {
-    NDArray *
-        out = (NDArray *) tvm->final_output;
+    NDArray *out = (NDArray *) tvm->final_output;
     gsize out_bytes = tvm->output_num_floats * sizeof (float);
 
     /* Map output buffer (write-only) */
@@ -776,12 +801,12 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
 
     /* Audio mode: interleave after TVM inference */
     if (tvm->audio_mode) {
-      guint8 *
-          tvm_output = (guint8 *) g_malloc (out_bytes);
+      GST_INFO_OBJECT (tvm,
+          "[AUDIO MODE] Interleaving %zu bytes after TVM inference", out_bytes);
+      guint8 *tvm_output = (guint8 *) g_malloc (out_bytes);
       out->CopyToBytes (tvm_output, out_bytes);
 
-      guint8 *
-          interleaved_data = NULL;
+      guint8 *interleaved_data = NULL;
       if (!gst_ti_tvm_interleave_audio (tvm, tvm_output, out_bytes,
               &interleaved_data)) {
         GST_ERROR_OBJECT (tvm, "Interleave failed");
@@ -793,6 +818,7 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
         return GST_FLOW_ERROR;
       }
 
+      GST_INFO_OBJECT (tvm, "[AUDIO MODE] Interleave complete");
       memcpy (out_map.data, interleaved_data, out_bytes);
       g_free (tvm_output);
       g_free (interleaved_data);
@@ -818,17 +844,14 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   return ret;
 }
 
-static
-    gboolean
+static gboolean
 gst_ti_tvm_load_model (GstTiTvm * tvm)
 {
   try {
-    gchar *
-        lib_path = g_strdup_printf ("%s/deploy_lib.so", tvm->model_path);
-    gchar *
-        graph_path = g_strdup_printf ("%s/deploy_graph.json", tvm->model_path);
-    gchar *
-        param_path =
+    gchar *lib_path = g_strdup_printf ("%s/deploy_lib.so", tvm->model_path);
+    gchar *graph_path =
+        g_strdup_printf ("%s/deploy_graph.json", tvm->model_path);
+    gchar *param_path =
         g_strdup_printf ("%s/deploy_param.params", tvm->model_path);
 
     GST_INFO_OBJECT (tvm, "[TVM] Initializing with artifacts from: %s",
@@ -836,8 +859,7 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
 
     /* Load TVM artifacts (same as C application) */
     Module lib = Module::LoadFromFile (lib_path);
-    gchar *
-        graph_json = gst_ti_tvm_load_json_file (graph_path);
+    gchar *graph_json = gst_ti_tvm_load_json_file (graph_path);
 
     if (!graph_json) {
       GST_ERROR_OBJECT (tvm, "Failed to load graph JSON from %s", graph_path);
@@ -874,8 +896,7 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
 
     /* Load parameters */
     gsize param_size;
-    gchar *
-        param_data = gst_ti_tvm_load_param_file (param_path, &param_size);
+    gchar *param_data = gst_ti_tvm_load_param_file (param_path, &param_size);
     if (!param_data) {
       GST_ERROR_OBJECT (tvm, "Failed to load parameters from %s", param_path);
       g_free (lib_path);
@@ -892,19 +913,19 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
     GST_INFO_OBJECT (tvm, "[TVM] Parameters loaded (%zu bytes)", param_size);
 
     tvm->graph_executor = new Module (executor);
-    PackedFunc *
-        set_input = new PackedFunc (executor.GetFunction ("set_input"));
-    PackedFunc *
-        run = new PackedFunc (executor.GetFunction ("run"));
-    PackedFunc *
-        get_output = new PackedFunc (executor.GetFunction ("get_output"));
+    PackedFunc *set_input = new PackedFunc (executor.GetFunction ("set_input"));
+    PackedFunc *run = new PackedFunc (executor.GetFunction ("run"));
+    PackedFunc *get_output =
+        new PackedFunc (executor.GetFunction ("get_output"));
 
     tvm->set_input_func = set_input;
     tvm->run_func = run;
     tvm->get_output_func = get_output;
 
     GST_INFO_OBJECT (tvm,
-        "[TVM] Input configuration: index=0, shape=[dynamic]");
+        "[TVM] Input configuration: index=0, shape=%s",
+        (tvm->input_shape
+            && strlen (tvm->input_shape) > 0) ? tvm->input_shape : "[dynamic]");
 
     tvm->tvm_initialized = TRUE;
 
@@ -924,24 +945,69 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
   }
 }
 
-static
-    GstFlowReturn
+static GstFlowReturn
 gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
     gsize input_size)
 {
   try {
-    PackedFunc *
-        set_input = (PackedFunc *) tvm->set_input_func;
-    PackedFunc *
-        run = (PackedFunc *) tvm->run_func;
-    PackedFunc *
-        get_output = (PackedFunc *) tvm->get_output_func;
+    PackedFunc *set_input = (PackedFunc *) tvm->set_input_func;
+    PackedFunc *run = (PackedFunc *) tvm->run_func;
+    PackedFunc *get_output = (PackedFunc *) tvm->get_output_func;
+
+    /* Parse input shape from property if provided */
+    std::vector < int64_t > shape;
+    if (tvm->input_shape && strlen (tvm->input_shape) > 0) {
+      gchar **shape_tokens = g_strsplit (tvm->input_shape, ",", -1);
+      if (shape_tokens) {
+        gint i = 0;
+        while (shape_tokens[i] != NULL) {
+          gchar *trimmed = g_strstrip (g_strdup (shape_tokens[i]));
+          if (strlen (trimmed) > 0) {
+            gint64 dim = g_ascii_strtoll (trimmed, NULL, 10);
+            if (dim > 0) {
+              shape.push_back (dim);
+            }
+          }
+          g_free (trimmed);
+          i++;
+        }
+        g_strfreev (shape_tokens);
+      }
+
+      /* Validate parsed shape matches input data size */
+      if (!shape.empty ()) {
+        gsize shape_elements = 1;
+        for (size_t i = 0; i < shape.size (); i++) {
+          shape_elements *= shape[i];
+        }
+        if (shape_elements != input_size) {
+          GST_ERROR_OBJECT (tvm,
+              "[TVM] Input shape [%s] requires %zu elements but got %zu floats",
+              tvm->input_shape, shape_elements, input_size);
+          return GST_FLOW_ERROR;
+        }
+        GST_INFO_OBJECT (tvm, "[TVM] Using input shape: [%s]",
+            tvm->input_shape);
+      } else {
+        GST_WARNING_OBJECT (tvm,
+            "[TVM] Failed to parse input-shape, using flat 1D shape");
+        shape = { static_cast < int64_t > (input_size) };
+      }
+    } else {
+      /* Default: flat 1D shape */
+      shape = { static_cast < int64_t > (input_size) };
+      GST_INFO_OBJECT (tvm,
+          "[TVM] No input-shape specified, using flat 1D shape: [%zu]",
+          input_size);
+    }
 
     /* Create input NDArray once (reused across iterations) */
-    std::vector < int64_t > shape = { static_cast < int64_t > (input_size) };
     NDArray input_array = NDArray::Empty (shape, DLDataType {
-        kDLFloat, 32, 1}, DLDevice {
-        kDLCPU, 0});
+          kDLFloat, 32, 1
+        }, DLDevice {
+          kDLCPU, 0
+        }
+    );
     input_array.CopyFromBytes (input_data, input_size * sizeof (float));
 
     if (tvm->benchmark) {
@@ -1065,10 +1131,8 @@ gst_ti_tvm_print_performance_stats (GstTiTvm * tvm)
 static gchar *
 gst_ti_tvm_load_json_file (const gchar * file_path)
 {
-  GError *
-      error = NULL;
-  gchar *
-      contents = NULL;
+  GError *error = NULL;
+  gchar *contents = NULL;
   gsize length;
 
   if (!g_file_get_contents (file_path, &contents, &length, &error)) {
@@ -1083,10 +1147,8 @@ gst_ti_tvm_load_json_file (const gchar * file_path)
 static gchar *
 gst_ti_tvm_load_param_file (const gchar * file_path, gsize * file_size)
 {
-  GError *
-      error = NULL;
-  gchar *
-      contents = NULL;
+  GError *error = NULL;
+  gchar *contents = NULL;
 
   if (!g_file_get_contents (file_path, &contents, file_size, &error)) {
     g_warning ("Failed to read parameter file %s: %s", file_path,
