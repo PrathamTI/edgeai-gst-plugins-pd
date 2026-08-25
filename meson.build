@@ -100,6 +100,11 @@ if get_option('tvm-plugins').enabled() and get_option('enable-tvm')
     plugin_deps += [tvm_dep]
     warning('TVM runtime library not found in sysroot - plugin will compile but may fail to load at runtime')
   endif
+
+  # Add json-c dependency for shape auto-detection from deploy_graph.json
+  json_c_dep = dependency('json-c', required : true, method : 'pkg-config')
+  plugin_deps += [json_c_dep]
+  message('json-c library found - titvm will support shape auto-detection')
 endif
 
 # stft-plugins on am62d: needs ti_rpmsg_dma library for RPMsg/DMA functions
@@ -260,6 +265,10 @@ endif
 
 if get_option('tvm-plugins').enabled()
   c_args += ['-DTVM_PLUGINS']
+endif
+
+if get_option('stft-plugins').enabled()
+  c_args += ['-DSTFT_PLUGINS']
 endif
 
 if get_option('enable-tidl').enabled() and SOC != 'am62x' and SOC != 'am62p'

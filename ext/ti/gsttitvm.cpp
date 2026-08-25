@@ -66,6 +66,7 @@
 #include "gsttirpmsgctx.h"
 #include <gst/gst.h>
 #include <gst/base/gstbasetransform.h>
+#include <json-c/json.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -182,6 +183,12 @@ gst_ti_tvm_load_json_file (const gchar * file_path);
 static gchar *
 gst_ti_tvm_load_param_file (const gchar * file_path, gsize * file_size);
 
+static
+    gboolean
+gst_ti_tvm_parse_shape_from_json (GstTiTvm * tvm, const gchar * graph_json,
+    std::vector < int64_t > &input_shape, std::vector < int64_t > &output_shape,
+    gchar ** input_name);
+
 /* Pad templates */
 static
     GstStaticPadTemplate
@@ -247,7 +254,8 @@ gst_ti_tvm_class_init (GstTiTvmClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_INPUT_SHAPE,
       g_param_spec_string ("input-shape", "Input Shape",
-          "Input tensor shape as comma-separated dimensions (e.g., \"1,2,401,161\")",
+          "Input tensor shape as comma-separated dimensions (e.g., \"1,2,401,161\"). "
+          "Optional: will be auto-detected from deploy_graph.json if not specified.",
           DEFAULT_INPUT_SHAPE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
@@ -303,6 +311,10 @@ gst_ti_tvm_init (GstTiTvm * tvm)
   tvm->set_input_func = NULL;
   tvm->run_func = NULL;
   tvm->get_output_func = NULL;
+
+  tvm->auto_input_name = NULL;
+  tvm->auto_input_shape = new std::vector < int64_t > ();
+  tvm->auto_output_shape = new std::vector < int64_t > ();
 
   tvm->rpmsg_ctx = NULL;
   tvm->dma_input = NULL;
@@ -420,6 +432,16 @@ gst_ti_tvm_finalize (GObject * object)
   g_free (tvm->model_path);
   g_free (tvm->input_shape);
   g_free (tvm->rproc_device);
+  g_free (tvm->auto_input_name);
+
+  if (tvm->auto_input_shape) {
+    delete static_cast < std::vector < int64_t > *>(tvm->auto_input_shape);
+    tvm->auto_input_shape = NULL;
+  }
+  if (tvm->auto_output_shape) {
+    delete static_cast < std::vector < int64_t > *>(tvm->auto_output_shape);
+    tvm->auto_output_shape = NULL;
+  }
 
   if (tvm->perf_data.inference_times) {
     g_free (tvm->perf_data.inference_times);
@@ -869,6 +891,29 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
       return FALSE;
     }
 
+    /* Parse shape from JSON if not provided via property */
+    std::vector < int64_t > json_input_shape;
+    std::vector < int64_t > json_output_shape;
+    gchar *json_input_name = NULL;
+
+    gboolean shape_parsed =
+        gst_ti_tvm_parse_shape_from_json (tvm, graph_json, json_input_shape,
+        json_output_shape, &json_input_name);
+
+    if (shape_parsed) {
+      *static_cast < std::vector < int64_t > *>(tvm->auto_input_shape) =
+          json_input_shape;
+      *static_cast < std::vector < int64_t > *>(tvm->auto_output_shape) =
+          json_output_shape;
+      if (json_input_name) {
+        tvm->auto_input_name = json_input_name;
+      }
+      GST_INFO_OBJECT (tvm, "[TVM] Shape auto-detection: SUCCESS");
+    } else {
+      GST_WARNING_OBJECT (tvm,
+          "[TVM] Shape auto-detection: FAILED (will require input-shape property)");
+    }
+
     auto graph_executor_create = Registry::Get ("tvm.graph_executor.create");
     if (!graph_executor_create) {
       GST_ERROR_OBJECT (tvm, "tvm.graph_executor.create not found in registry");
@@ -954,9 +999,37 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
     PackedFunc *run = (PackedFunc *) tvm->run_func;
     PackedFunc *get_output = (PackedFunc *) tvm->get_output_func;
 
-    /* Parse input shape from property if provided */
+    /* Determine input shape: priority order is auto-detected > property > flat 1D */
     std::vector < int64_t > shape;
-    if (tvm->input_shape && strlen (tvm->input_shape) > 0) {
+
+    /* Option 1: Use auto-detected shape from JSON if available */
+    std::vector < int64_t > *auto_shape_ptr =
+        static_cast < std::vector < int64_t > *>(tvm->auto_input_shape);
+    if (auto_shape_ptr && !auto_shape_ptr->empty ()) {
+      shape = *auto_shape_ptr;
+
+      /* Validate auto-detected shape matches input data size */
+      gsize shape_elements = 1;
+      for (size_t i = 0; i < shape.size (); i++) {
+        shape_elements *= shape[i];
+      }
+      if (shape_elements != input_size) {
+        GST_ERROR_OBJECT (tvm,
+            "[TVM] Auto-detected shape requires %zu elements but got %zu floats",
+            shape_elements, input_size);
+        return GST_FLOW_ERROR;
+      }
+
+      if (shape.size () == 4) {
+        GST_INFO_OBJECT (tvm,
+            "[TVM] Using auto-detected shape: [%ld,%ld,%ld,%ld]", shape[0],
+            shape[1], shape[2], shape[3]);
+      } else {
+        GST_INFO_OBJECT (tvm, "[TVM] Using auto-detected shape");
+      }
+    }
+    /* Option 2: Parse input shape from property if provided */
+    else if (tvm->input_shape && strlen (tvm->input_shape) > 0) {
       gchar **shape_tokens = g_strsplit (tvm->input_shape, ",", -1);
       if (shape_tokens) {
         gint i = 0;
@@ -1128,6 +1201,123 @@ gst_ti_tvm_print_performance_stats (GstTiTvm * tvm)
 }
 
 /* Helper functions */
+
+static gboolean
+gst_ti_tvm_parse_shape_from_json (GstTiTvm * tvm, const gchar * graph_json,
+    std::vector < int64_t > &input_shape, std::vector < int64_t > &output_shape,
+    gchar ** input_name)
+{
+  struct json_object *root_obj = NULL;
+  struct json_object *attrs_obj = NULL;
+  struct json_object *shape_array = NULL;
+  struct json_object *nodes_array = NULL;
+  struct json_object *arg_nodes_array = NULL;
+  struct json_object *shapes = NULL;
+  struct json_object *input_shape_array = NULL;
+  struct json_object *output_shape_array = NULL;
+  struct json_object *first_arg_node = NULL;
+  struct json_object *input_node = NULL;
+  struct json_object *name_obj = NULL;
+  gboolean ret = FALSE;
+
+  root_obj = json_tokener_parse (graph_json);
+  if (!root_obj) {
+    GST_WARNING_OBJECT (tvm, "Failed to parse JSON");
+    goto cleanup;
+  }
+
+  /* Extract input tensor name from nodes array */
+  if (json_object_object_get_ex (root_obj, "nodes", &nodes_array) &&
+      json_object_object_get_ex (root_obj, "arg_nodes", &arg_nodes_array)) {
+    first_arg_node = json_object_array_get_idx (arg_nodes_array, 0);
+    if (first_arg_node) {
+      gint input_node_idx = json_object_get_int (first_arg_node);
+      input_node = json_object_array_get_idx (nodes_array, input_node_idx);
+      if (input_node) {
+        if (json_object_object_get_ex (input_node, "name", &name_obj)) {
+          const gchar *name = json_object_get_string (name_obj);
+          *input_name = g_strdup (name);
+          GST_DEBUG_OBJECT (tvm, "[JSON] Input tensor name: %s", *input_name);
+        }
+      }
+    }
+  }
+
+  /* Get attrs object */
+  if (!json_object_object_get_ex (root_obj, "attrs", &attrs_obj)) {
+    GST_WARNING_OBJECT (tvm, "JSON missing 'attrs' field");
+    goto cleanup;
+  }
+
+  /* Get shape array */
+  if (!json_object_object_get_ex (attrs_obj, "shape", &shape_array)) {
+    GST_WARNING_OBJECT (tvm, "JSON missing 'attrs.shape' field");
+    goto cleanup;
+  }
+
+  /* Shape array format: ["list_shape", [[input_shape], [output_shape]]] */
+  if (json_object_array_length (shape_array) < 2) {
+    GST_WARNING_OBJECT (tvm, "Invalid shape array length");
+    goto cleanup;
+  }
+
+  /* Get the actual shapes array (second element) */
+  shapes = json_object_array_get_idx (shape_array, 1);
+  if (!shapes) {
+    GST_WARNING_OBJECT (tvm, "Failed to get shapes array");
+    goto cleanup;
+  }
+
+  if (json_object_array_length (shapes) < 2) {
+    GST_WARNING_OBJECT (tvm,
+        "Invalid shapes array, expected at least 2 elements");
+    goto cleanup;
+  }
+
+  /* Parse input shape (first element) */
+  input_shape_array = json_object_array_get_idx (shapes, 0);
+  if (input_shape_array) {
+    size_t input_shape_len = json_object_array_length (input_shape_array);
+    for (size_t i = 0; i < input_shape_len; i++) {
+      struct json_object *dim_obj =
+          json_object_array_get_idx (input_shape_array, i);
+      gint64 dim = json_object_get_int64 (dim_obj);
+      input_shape.push_back (dim);
+    }
+  }
+
+  /* Parse output shape (second element) */
+  output_shape_array = json_object_array_get_idx (shapes, 1);
+  if (output_shape_array) {
+    size_t output_shape_len = json_object_array_length (output_shape_array);
+    for (size_t i = 0; i < output_shape_len; i++) {
+      struct json_object *dim_obj =
+          json_object_array_get_idx (output_shape_array, i);
+      gint64 dim = json_object_get_int64 (dim_obj);
+      output_shape.push_back (dim);
+    }
+  }
+
+  if (input_shape.size () == 4) {
+    GST_INFO_OBJECT (tvm, "[JSON] Auto-detected input shape: [%ld,%ld,%ld,%ld]",
+        input_shape[0], input_shape[1], input_shape[2], input_shape[3]);
+  }
+
+  if (output_shape.size () == 4) {
+    GST_INFO_OBJECT (tvm,
+        "[JSON] Auto-detected output shape: [%ld,%ld,%ld,%ld]",
+        output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
+  }
+
+  ret = TRUE;
+
+cleanup:
+  if (root_obj) {
+    json_object_put (root_obj);
+  }
+  return ret;
+}
+
 static gchar *
 gst_ti_tvm_load_json_file (const gchar * file_path)
 {

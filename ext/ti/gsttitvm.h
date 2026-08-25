@@ -120,6 +120,11 @@ struct _GstTiTvm
     void *run_func;               /* TVM run function */
     void *get_output_func;        /* TVM get_output function */
 
+    /* Auto-detected from deploy_graph.json */
+    void *auto_input_shape;       /* std::vector<int64_t>* */
+    void *auto_output_shape;      /* std::vector<int64_t>* */
+    gchar *auto_input_name;
+
     /* Audio mode: RPMsg context and DMA buffers */
     void *rpmsg_ctx;              /* Shared RPMsg context (GstTiRpmsgCtx*) */
     void *dma_input;              /* DMA buffer for interleaved input (struct dma_buf_params*) */
