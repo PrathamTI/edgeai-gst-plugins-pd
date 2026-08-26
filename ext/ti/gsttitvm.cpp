@@ -63,7 +63,6 @@
 #endif
 
 #include "gsttitvm.h"
-#include "gsttirpmsgctx.h"
 #include <gst/gst.h>
 #include <gst/base/gstbasetransform.h>
 #include <json-c/json.h>
@@ -269,12 +268,6 @@ gst_ti_tvm_class_init (GstTiTvmClass * klass)
           "Enable performance benchmarking output", DEFAULT_BENCHMARK,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
-  g_object_class_install_property (gobject_class, PROP_AUDIO_MODE,
-      g_param_spec_boolean ("audio-mode", "Audio Mode",
-          "Enable audio enhancement mode (deinterleave/interleave via C7x DSP)",
-          DEFAULT_AUDIO_MODE,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
   g_object_class_install_property (gobject_class, PROP_RPROC_DEVICE,
       g_param_spec_string ("rproc-device", "Remoteproc Device",
           "Remoteproc cdev for DMA buffer physical address lookup",
@@ -301,7 +294,6 @@ gst_ti_tvm_init (GstTiTvm * tvm)
   tvm->input_shape = g_strdup (DEFAULT_INPUT_SHAPE);
   tvm->iterations = DEFAULT_ITERATIONS;
   tvm->benchmark = DEFAULT_BENCHMARK;
-  tvm->audio_mode = DEFAULT_AUDIO_MODE;
   tvm->rproc_device = g_strdup (DEFAULT_RPROC_DEVICE);
   tvm->rproc_id = DEFAULT_RPROC_ID;
   tvm->remote_ep = DEFAULT_REMOTE_EP;
@@ -315,13 +307,6 @@ gst_ti_tvm_init (GstTiTvm * tvm)
   tvm->auto_input_name = NULL;
   tvm->auto_input_shape = new std::vector < int64_t > ();
   tvm->auto_output_shape = new std::vector < int64_t > ();
-
-  tvm->rpmsg_ctx = NULL;
-  tvm->dma_input = NULL;
-  tvm->dma_deint = NULL;
-  tvm->dma_inter = NULL;
-  tvm->dma_allocated = FALSE;
-  tvm->sequence_number = 1;
 
   tvm->final_output = NULL;
   tvm->output_num_floats = 0;
@@ -354,9 +339,6 @@ gst_ti_tvm_set_property (GObject * object, guint property_id,
       break;
     case PROP_BENCHMARK:
       tvm->benchmark = g_value_get_boolean (value);
-      break;
-    case PROP_AUDIO_MODE:
-      tvm->audio_mode = g_value_get_boolean (value);
       break;
     case PROP_RPROC_DEVICE:
       g_free (tvm->rproc_device);
@@ -395,9 +377,6 @@ gst_ti_tvm_get_property (GObject * object, guint property_id,
       break;
     case PROP_BENCHMARK:
       g_value_set_boolean (value, tvm->benchmark);
-      break;
-    case PROP_AUDIO_MODE:
-      g_value_set_boolean (value, tvm->audio_mode);
       break;
     case PROP_RPROC_DEVICE:
       g_value_set_string (value, tvm->rproc_device);
@@ -459,7 +438,6 @@ gst_ti_tvm_start (GstBaseTransform * trans)
   GST_DEBUG_OBJECT (tvm, "Starting TI TVM inference element");
   g_print ("TI TVM Inference Element\n");
   g_print ("========================\n");
-  g_print ("[TVM] Audio mode: %s\n", tvm->audio_mode ? "enabled" : "disabled");
 
   /* Initialize TVM runtime */
   if (!gst_ti_tvm_load_model (tvm)) {
@@ -469,51 +447,6 @@ gst_ti_tvm_start (GstBaseTransform * trans)
 
   /* Allocate performance tracking arrays */
   tvm->perf_data.inference_times = g_new0 (gint64, tvm->iterations);
-
-  /* Audio mode: acquire RPMsg channel and allocate DMA buffers */
-  if (tvm->audio_mode) {
-    tvm->rpmsg_ctx = gst_ti_rpmsg_chan_acquire (tvm->rproc_id, tvm->remote_ep);
-    if (!tvm->rpmsg_ctx) {
-      GST_ERROR_OBJECT (tvm,
-          "Failed to acquire rpmsg channel (rproc_id=%u, remote_ep=%u)",
-          tvm->rproc_id, tvm->remote_ep);
-      return FALSE;
-    }
-    g_print ("[TVM] RPMsg channel acquired (rproc=%u ep=%u fd=%d)\n",
-        tvm->rproc_id, tvm->remote_ep, ((GstTiRpmsgChan *) tvm->rpmsg_ctx)->fd);
-
-    /* Allocate DMA buffers for deinterleave/interleave operations */
-    tvm->dma_input = g_new0 (struct dma_buf_params, 1);
-    tvm->dma_deint = g_new0 (struct dma_buf_params, 1);
-    tvm->dma_inter = g_new0 (struct dma_buf_params, 1);
-
-    int r1 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
-        tvm->rproc_device, (struct dma_buf_params *) tvm->dma_input);
-    int r2 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
-        tvm->rproc_device, (struct dma_buf_params *) tvm->dma_deint);
-    int r3 = dmabuf_heap_init ((char *) "linux,cma", TVM_AUDIO_BUFFER_SIZE,
-        tvm->rproc_device, (struct dma_buf_params *) tvm->dma_inter);
-
-    if (r1 != 0 || r2 != 0 || r3 != 0) {
-      GST_ERROR_OBJECT (tvm, "DMA alloc failed (r1=%d r2=%d r3=%d)", r1, r2,
-          r3);
-      if (r1 == 0)
-        dmabuf_heap_destroy ((struct dma_buf_params *) tvm->dma_input);
-      if (r2 == 0)
-        dmabuf_heap_destroy ((struct dma_buf_params *) tvm->dma_deint);
-      if (r3 == 0)
-        dmabuf_heap_destroy ((struct dma_buf_params *) tvm->dma_inter);
-      g_free (tvm->dma_input);
-      g_free (tvm->dma_deint);
-      g_free (tvm->dma_inter);
-      gst_ti_rpmsg_chan_release ((GstTiRpmsgChan *) tvm->rpmsg_ctx);
-      return FALSE;
-    }
-
-    tvm->dma_allocated = TRUE;
-    g_print ("[TVM] Audio mode DMA buffers allocated (%u bytes each)\n",
-        TVM_AUDIO_BUFFER_SIZE);
-  }
 
   GST_DEBUG_OBJECT (tvm, "TI TVM element started successfully");
 
@@ -548,22 +481,6 @@ gst_ti_tvm_stop (GstBaseTransform * trans)
   if (tvm->final_output) {
     delete (NDArray *) tvm->final_output;
     tvm->final_output = NULL;
-  }
-
-  /* Clean up audio mode resources */
-  if (tvm->audio_mode && tvm->dma_allocated) {
-    dmabuf_heap_destroy ((struct dma_buf_params *) tvm->dma_input);
-    dmabuf_heap_destroy ((struct dma_buf_params *) tvm->dma_deint);
-    dmabuf_heap_destroy ((struct dma_buf_params *) tvm->dma_inter);
-    g_free (tvm->dma_input);
-    g_free (tvm->dma_deint);
-    g_free (tvm->dma_inter);
-    tvm->dma_allocated = FALSE;
-  }
-
-  if (tvm->rpmsg_ctx) {
-    gst_ti_rpmsg_chan_release ((GstTiRpmsgChan *) tvm->rpmsg_ctx);
-    tvm->rpmsg_ctx = NULL;
   }
 
   GST_DEBUG_OBJECT (tvm, "TI TVM element stopped");
@@ -624,134 +541,6 @@ gst_ti_tvm_prepare_output_buffer (GstBaseTransform * trans, GstBuffer * inbuf,
   return GST_FLOW_OK;
 }
 
-/* Audio mode helper: Deinterleave complex spectral data via C7x DSP */
-static gboolean
-gst_ti_tvm_deinterleave_audio (GstTiTvm * tvm, const guint8 * interleaved_data,
-    gsize data_size, guint8 ** deinterleaved_out)
-{
-  struct dma_buf_params *dma_in = (struct dma_buf_params *) tvm->dma_input;
-  struct dma_buf_params *dma_out = (struct dma_buf_params *) tvm->dma_deint;
-  GstTiRpmsgChan *ctx = (GstTiRpmsgChan *) tvm->rpmsg_ctx;
-
-  /* Copy interleaved data to input DMA buffer */
-  dmabuf_sync (dma_in->dma_buf_fd, DMA_BUF_SYNC_START);
-  memcpy (dma_in->kern_addr, interleaved_data, data_size);
-  dmabuf_sync (dma_in->dma_buf_fd, DMA_BUF_SYNC_END);
-
-  /* Send deinterleave request to C7x */
-  struct audio_msg req = { };
-  req.hdr.type = C7X_MSG_DEINTERLEAVE;
-  req.hdr.seq = tvm->sequence_number++;
-  req.hdr.len = sizeof (req);
-  req.hdr.status = 0;
-  req.input_buffer = (uint32_t) dma_in->phys_addr;
-  req.output_buffer = (uint32_t) dma_out->phys_addr;
-  req.input_frame = 401;        // GCRN_TOTAL_FRAMES
-  req.fft_size = 320;           // GCRN_FFT_SIZE
-  req.flag = 0;                 // 0 = deinterleave
-
-  GST_DEBUG_OBJECT (tvm,
-      "[RPMsg] Sending DEINTERLEAVE: seq=%d frames=%u fft_size=%u flag=%u in=0x%x out=0x%x",
-      req.hdr.seq, req.input_frame, req.fft_size, req.flag, req.input_buffer,
-      req.output_buffer);
-
-  if (send_msg (ctx->fd, (char *) &req, sizeof (req)) < 0) {
-    GST_ERROR_OBJECT (tvm, "send_msg DEINTERLEAVE failed");
-    return FALSE;
-  }
-
-  /* Receive response */
-  struct audio_msg resp = { };
-  int resp_len = sizeof (resp);
-  if (recv_msg (ctx->fd, sizeof (resp), (char *) &resp, &resp_len) < 0) {
-    GST_ERROR_OBJECT (tvm, "recv_msg DEINTERLEAVE_RESP failed");
-    return FALSE;
-  }
-
-  GST_DEBUG_OBJECT (tvm,
-      "[RPMsg] Received DEINTERLEAVE_RESP: type=0x%x status=%d", resp.hdr.type,
-      resp.hdr.status);
-
-  if (resp.hdr.type != C7X_MSG_DEINTERLEAVE_RESP
-      || resp.hdr.status != C7X_STATUS_SUCCESS) {
-    GST_ERROR_OBJECT (tvm, "Deinterleave failed: type=0x%x status=%d",
-        resp.hdr.type, resp.hdr.status);
-    return FALSE;
-  }
-
-  /* Copy deinterleaved result from DMA buffer */
-  dmabuf_sync (dma_out->dma_buf_fd, DMA_BUF_SYNC_START);
-  *deinterleaved_out = (guint8 *) g_malloc (data_size);
-  memcpy (*deinterleaved_out, dma_out->kern_addr, data_size);
-  dmabuf_sync (dma_out->dma_buf_fd, DMA_BUF_SYNC_END);
-
-  return TRUE;
-}
-
-/* Audio mode helper: Interleave complex spectral data via C7x DSP */
-static gboolean
-gst_ti_tvm_interleave_audio (GstTiTvm * tvm, const guint8 * deinterleaved_data,
-    gsize data_size, guint8 ** interleaved_out)
-{
-  struct dma_buf_params *dma_in = (struct dma_buf_params *) tvm->dma_deint;
-  struct dma_buf_params *dma_out = (struct dma_buf_params *) tvm->dma_inter;
-  GstTiRpmsgChan *ctx = (GstTiRpmsgChan *) tvm->rpmsg_ctx;
-
-  /* Copy deinterleaved data to input DMA buffer */
-  dmabuf_sync (dma_in->dma_buf_fd, DMA_BUF_SYNC_START);
-  memcpy (dma_in->kern_addr, deinterleaved_data, data_size);
-  dmabuf_sync (dma_in->dma_buf_fd, DMA_BUF_SYNC_END);
-
-  /* Send interleave request to C7x */
-  struct audio_msg req = { };
-  req.hdr.type = C7X_MSG_INTERLEAVE;
-  req.hdr.seq = tvm->sequence_number++;
-  req.hdr.len = sizeof (req);
-  req.hdr.status = 0;
-  req.input_buffer = (uint32_t) dma_in->phys_addr;
-  req.output_buffer = (uint32_t) dma_out->phys_addr;
-  req.input_frame = 401;        // GCRN_TOTAL_FRAMES
-  req.fft_size = 320;           // GCRN_FFT_SIZE
-  req.flag = 1;                 // 1 = interleave
-
-  GST_DEBUG_OBJECT (tvm,
-      "[RPMsg] Sending INTERLEAVE: seq=%d frames=%u fft_size=%u flag=%u in=0x%x out=0x%x",
-      req.hdr.seq, req.input_frame, req.fft_size, req.flag, req.input_buffer,
-      req.output_buffer);
-
-  if (send_msg (ctx->fd, (char *) &req, sizeof (req)) < 0) {
-    GST_ERROR_OBJECT (tvm, "send_msg INTERLEAVE failed");
-    return FALSE;
-  }
-
-  /* Receive response */
-  struct audio_msg resp = { };
-  int resp_len = sizeof (resp);
-  if (recv_msg (ctx->fd, sizeof (resp), (char *) &resp, &resp_len) < 0) {
-    GST_ERROR_OBJECT (tvm, "recv_msg INTERLEAVE_RESP failed");
-    return FALSE;
-  }
-
-  GST_DEBUG_OBJECT (tvm,
-      "[RPMsg] Received INTERLEAVE_RESP: type=0x%x status=%d", resp.hdr.type,
-      resp.hdr.status);
-
-  if (resp.hdr.type != C7X_MSG_INTERLEAVE_RESP
-      || resp.hdr.status != C7X_STATUS_SUCCESS) {
-    GST_ERROR_OBJECT (tvm, "Interleave failed: type=0x%x status=%d",
-        resp.hdr.type, resp.hdr.status);
-    return FALSE;
-  }
-
-  /* Copy interleaved result from DMA buffer */
-  dmabuf_sync (dma_out->dma_buf_fd, DMA_BUF_SYNC_START);
-  *interleaved_out = (guint8 *) g_malloc (data_size);
-  memcpy (*interleaved_out, dma_out->kern_addr, data_size);
-  dmabuf_sync (dma_out->dma_buf_fd, DMA_BUF_SYNC_END);
-
-  return TRUE;
-}
-
 static GstFlowReturn
 gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     GstBuffer * outbuf)
@@ -776,30 +565,8 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     return GST_FLOW_OK;
   }
 
-  gfloat *input_data = NULL;
-  gsize input_size = 0;
-  guint8 *deinterleaved_data = NULL;
-  gboolean need_free_deint = FALSE;
-
-  /* Audio mode: deinterleave first */
-  if (tvm->audio_mode) {
-    GST_INFO_OBJECT (tvm,
-        "[AUDIO MODE] Deinterleaving %zu bytes before TVM inference",
-        in_map.size);
-    if (!gst_ti_tvm_deinterleave_audio (tvm, in_map.data, in_map.size,
-            &deinterleaved_data)) {
-      GST_ERROR_OBJECT (tvm, "Deinterleave failed");
-      gst_buffer_unmap (inbuf, &in_map);
-      return GST_FLOW_ERROR;
-    }
-    GST_INFO_OBJECT (tvm, "[AUDIO MODE] Deinterleave complete");
-    input_data = (gfloat *) deinterleaved_data;
-    input_size = in_map.size / sizeof (gfloat);
-    need_free_deint = TRUE;
-  } else {
-    input_data = (gfloat *) in_map.data;
-    input_size = in_map.size / sizeof (gfloat);
-  }
+  gfloat *input_data = (gfloat *) in_map.data;
+  gsize input_size = in_map.size / sizeof (gfloat);
 
   GST_DEBUG_OBJECT (tvm, "transform: %zu floats (%zu bytes)", input_size,
       in_map.size);
@@ -815,39 +582,12 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     /* Map output buffer (write-only) */
     if (!gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE)) {
       GST_ERROR_OBJECT (tvm, "Failed to map output buffer");
-      if (need_free_deint)
-        g_free (deinterleaved_data);
       gst_buffer_unmap (inbuf, &in_map);
       return GST_FLOW_ERROR;
     }
 
-    /* Audio mode: interleave after TVM inference */
-    if (tvm->audio_mode) {
-      GST_INFO_OBJECT (tvm,
-          "[AUDIO MODE] Interleaving %zu bytes after TVM inference", out_bytes);
-      guint8 *tvm_output = (guint8 *) g_malloc (out_bytes);
-      out->CopyToBytes (tvm_output, out_bytes);
-
-      guint8 *interleaved_data = NULL;
-      if (!gst_ti_tvm_interleave_audio (tvm, tvm_output, out_bytes,
-              &interleaved_data)) {
-        GST_ERROR_OBJECT (tvm, "Interleave failed");
-        g_free (tvm_output);
-        gst_buffer_unmap (outbuf, &out_map);
-        if (need_free_deint)
-          g_free (deinterleaved_data);
-        gst_buffer_unmap (inbuf, &in_map);
-        return GST_FLOW_ERROR;
-      }
-
-      GST_INFO_OBJECT (tvm, "[AUDIO MODE] Interleave complete");
-      memcpy (out_map.data, interleaved_data, out_bytes);
-      g_free (tvm_output);
-      g_free (interleaved_data);
-    } else {
-      /* Non-audio mode: direct copy */
-      out->CopyToBytes (out_map.data, out_bytes);
-    }
+    /* Copy TVM output to buffer */
+    out->CopyToBytes (out_map.data, out_bytes);
 
     gst_buffer_unmap (outbuf, &out_map);
 
@@ -855,9 +595,6 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     gst_buffer_set_size (outbuf, (gssize) out_bytes);
   }
 
-  /* Clean up */
-  if (need_free_deint)
-    g_free (deinterleaved_data);
   gst_buffer_unmap (inbuf, &in_map);
 
   if (ret != GST_FLOW_OK)

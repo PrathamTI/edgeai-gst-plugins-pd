@@ -67,6 +67,7 @@
 #include <gst/base/gstbasetransform.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 extern "C"
 {
@@ -154,6 +155,9 @@ enum
 #define DEFAULT_BATCH_SIZE      64
 
 /* Function prototypes */
+static void gst_dsp_kernel_auto_detect_operation (GstDspKernel * kernel);
+static gboolean gst_dsp_kernel_sink_event (GstBaseTransform * trans,
+    GstEvent * event);
 static void gst_dsp_kernel_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
 static void gst_dsp_kernel_get_property (GObject * object, guint prop_id,
@@ -210,6 +214,7 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
   bt->stop = GST_DEBUG_FUNCPTR (gst_dsp_kernel_stop);
   bt->transform_ip = GST_DEBUG_FUNCPTR (gst_dsp_kernel_transform_ip);
   bt->transform_caps = GST_DEBUG_FUNCPTR (gst_dsp_kernel_transform_caps);
+  bt->sink_event = GST_DEBUG_FUNCPTR (gst_dsp_kernel_sink_event);
   bt->passthrough_on_same_caps = FALSE;
 
   /* Install properties */
@@ -255,18 +260,6 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
           0, G_MAXUINT, DEFAULT_OUTPUT_BUF_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
-  g_object_class_install_property (gobject_class, PROP_PARAM0,
-      g_param_spec_uint ("param0", "Parameter 0",
-          "DSP kernel parameter 0 (input_frames for STFT/ISTFT)",
-          0, G_MAXUINT, DEFAULT_PARAM0,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_PARAM1,
-      g_param_spec_uint ("param1", "Parameter 1",
-          "DSP kernel parameter 1 (output_frames/fft_size)",
-          0, G_MAXUINT, DEFAULT_PARAM1,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
   g_object_class_install_property (gobject_class, PROP_PARAM2,
       g_param_spec_uint ("param2", "Parameter 2",
           "DSP kernel parameter 2 (graph_id/flag: 0=deinterleave, 1=interleave)",
@@ -298,6 +291,54 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
+/* Auto-detect operation type from element name */
+static void
+gst_dsp_kernel_auto_detect_operation (GstDspKernel * kernel)
+{
+  /* Only auto-detect if msg_type is not already set */
+  if (kernel->msg_type != 0) {
+    return;
+  }
+
+  const gchar *name = GST_ELEMENT_NAME (kernel);
+  GST_INFO_OBJECT (kernel, "Auto-detecting operation from element name: %s",
+      name);
+
+  /* IMPORTANT: Check longer suffixes first to avoid false matches!
+   * "istft" ends with "stft", so check "istft" BEFORE "stft"
+   * "deinterleave" ends with "interleave", so check "deinterleave" BEFORE "interleave" */
+
+  if (g_str_has_suffix (name, "istft") || g_strcmp0 (name, "istft") == 0) {
+    kernel->msg_type = DSP_OP_ISTFT;
+    GST_INFO_OBJECT (kernel, "Auto-detected: ISTFT (0x%04x)", kernel->msg_type);
+  } else if (g_str_has_suffix (name, "stft") || g_strcmp0 (name, "stft") == 0) {
+    kernel->msg_type = DSP_OP_STFT;
+    GST_INFO_OBJECT (kernel, "Auto-detected: STFT (0x%04x)", kernel->msg_type);
+  } else if (g_str_has_suffix (name, "deinterleave")
+      || g_strcmp0 (name, "deinterleave") == 0) {
+    kernel->msg_type = DSP_OP_DEINT_INTERLEAVE;
+    kernel->param2 = 0;         /* 0 = deinterleave */
+    GST_INFO_OBJECT (kernel, "Auto-detected: Deinterleave (0x%04x, flag=0)",
+        kernel->msg_type);
+  } else if (g_str_has_suffix (name, "interleave")
+      || g_strcmp0 (name, "interleave") == 0) {
+    kernel->msg_type = DSP_OP_DEINT_INTERLEAVE;
+    kernel->param2 = 1;         /* 1 = interleave */
+    GST_INFO_OBJECT (kernel, "Auto-detected: Interleave (0x%04x, flag=1)",
+        kernel->msg_type);
+  } else {
+    GST_WARNING_OBJECT (kernel,
+        "Could not auto-detect operation from name '%s'", name);
+  }
+
+  /* Auto-derive response type if detected */
+  if (kernel->msg_resp_type == 0 && kernel->msg_type != 0) {
+    kernel->msg_resp_type = (kernel->msg_type & 0x0FFF) | 0x2000;
+    GST_INFO_OBJECT (kernel, "Auto-derived msg-resp-type: 0x%04x",
+        kernel->msg_resp_type);
+  }
+}
+
 static void
 gst_dsp_kernel_init (GstDspKernel * kernel)
 {
@@ -310,8 +351,6 @@ gst_dsp_kernel_init (GstDspKernel * kernel)
   kernel->msg_resp_type = DEFAULT_MSG_RESP_TYPE;
   kernel->input_buf_size = DEFAULT_INPUT_BUF_SIZE;
   kernel->output_buf_size = DEFAULT_OUTPUT_BUF_SIZE;
-  kernel->param0 = DEFAULT_PARAM0;
-  kernel->param1 = DEFAULT_PARAM1;
   kernel->param2 = DEFAULT_PARAM2;
   kernel->hop_size = DEFAULT_HOP_SIZE;
   kernel->fft_size = DEFAULT_FFT_SIZE;
@@ -322,15 +361,40 @@ gst_dsp_kernel_init (GstDspKernel * kernel)
   kernel->sequence_number = 1;
   kernel->dma_allocated = FALSE;
 
-  kernel->stft_accumulator = NULL;
-  kernel->stft_accumulated_samples = 0;
-  kernel->stft_total_samples = 0;
+  /* Overlap-save chunking initialization */
+  kernel->input_buffer = NULL;
+  kernel->input_buffer_size = 0;
+  kernel->input_buffer_capacity = 0;
 
-  kernel->istft_overlap_buffer = NULL;
-  kernel->istft_overlap_samples = 0;
+  /* Overlap-save parameters (will be calculated in start()) */
+  kernel->overlap_frames = 0;
+  kernel->t_frames = 0;
+  kernel->hop_frames = 0;
+  kernel->hop_samples = 0;
+  kernel->chunk_samples = 0;
+
+  kernel->n_chunks = 0;
+  kernel->total_padded_len = 0;
+  kernel->padded_samples_added = 0;
+  kernel->chunking_in_progress = FALSE;
+
+  kernel->eos_received = FALSE;
+
+  /* Chunk collection for overlap-save reconstruction */
+  kernel->collected_audio = NULL;
+  kernel->collected_audio_size = 0;
+  kernel->collected_audio_capacity = 0;
+  kernel->chunks_received = 0;
+
+  /* Chunk count from upstream */
+  kernel->expected_n_chunks = 0;
+  kernel->chunk_buffer_counter = 0;
 
   memset (&kernel->dma_input, 0, sizeof (kernel->dma_input));
   memset (&kernel->dma_output, 0, sizeof (kernel->dma_output));
+
+  /* Auto-detect operation from element name */
+  gst_dsp_kernel_auto_detect_operation (kernel);
 }
 
 static void
@@ -361,12 +425,6 @@ gst_dsp_kernel_set_property (GObject * object, guint prop_id,
       break;
     case PROP_OUTPUT_BUF_SIZE:
       kernel->output_buf_size = g_value_get_uint (value);
-      break;
-    case PROP_PARAM0:
-      kernel->param0 = g_value_get_uint (value);
-      break;
-    case PROP_PARAM1:
-      kernel->param1 = g_value_get_uint (value);
       break;
     case PROP_PARAM2:
       kernel->param2 = g_value_get_uint (value);
@@ -417,12 +475,6 @@ gst_dsp_kernel_get_property (GObject * object, guint prop_id,
     case PROP_OUTPUT_BUF_SIZE:
       g_value_set_uint (value, kernel->output_buf_size);
       break;
-    case PROP_PARAM0:
-      g_value_set_uint (value, kernel->param0);
-      break;
-    case PROP_PARAM1:
-      g_value_set_uint (value, kernel->param1);
-      break;
     case PROP_PARAM2:
       g_value_set_uint (value, kernel->param2);
       break;
@@ -449,14 +501,6 @@ gst_dsp_kernel_finalize (GObject * object)
 {
   GstDspKernel *kernel = GST_DSP_KERNEL (object);
   g_free (kernel->rproc_device);
-  if (kernel->stft_accumulator) {
-    g_free (kernel->stft_accumulator);
-    kernel->stft_accumulator = NULL;
-  }
-  if (kernel->istft_overlap_buffer) {
-    g_free (kernel->istft_overlap_buffer);
-    kernel->istft_overlap_buffer = NULL;
-  }
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
@@ -465,24 +509,33 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
 {
   GstDspKernel *kernel = GST_DSP_KERNEL (trans);
 
+  /* Ensure auto-detection has been done (should already be done in init) */
+  gst_dsp_kernel_auto_detect_operation (kernel);
+
   g_print ("TI DSP Kernel Element\n");
   g_print ("=====================\n");
   g_print ("[DSP] msg-type: 0x%04x ", kernel->msg_type);
   switch (kernel->msg_type) {
     case DSP_OP_STFT:
       g_print ("(STFT)\n");
-      kernel->stft_total_samples = kernel->hop_size * kernel->window_frames;
-      kernel->stft_accumulator = g_new0 (gint16, kernel->stft_total_samples);
-      kernel->stft_accumulated_samples = 0;
-      g_print ("[DSP] STFT: accumulating %zu samples (%.2f sec @ 16kHz)\n",
-          kernel->stft_total_samples, kernel->stft_total_samples / 16000.0);
+      g_print ("[DSP] STFT: initializing overlap-save chunking\n");
+
+      /* Initialize overlap-save parameters */
+      kernel->overlap_frames = 100;     /* Fixed overlap */
+      kernel->t_frames = kernel->overlap_frames / 2;    /* = 50 */
+      kernel->hop_frames = kernel->window_frames - kernel->overlap_frames;
+      kernel->hop_samples = kernel->hop_frames * kernel->hop_size;
+      kernel->chunk_samples = kernel->window_frames * kernel->hop_size;
+
+      g_print
+          ("[DSP] Overlap-save: OVERLAP=%zu T_FRAMES=%zu HOP_FRAMES=%zu HOP_SAMPLES=%zu\n",
+          kernel->overlap_frames, kernel->t_frames, kernel->hop_frames,
+          kernel->hop_samples);
       break;
     case DSP_OP_ISTFT:
       g_print ("(ISTFT)\n");
-      kernel->istft_overlap_samples = kernel->fft_size - kernel->hop_size;
-      kernel->istft_overlap_buffer = g_new0 (gfloat, kernel->fft_size);
-      g_print ("[DSP] ISTFT: overlap-add with %zu samples\n",
-          kernel->istft_overlap_samples);
+      g_print
+          ("[DSP] ISTFT: initializing for chunk collection and reconstruction\n");
       break;
     case DSP_OP_DEINT_INTERLEAVE:
       g_print ("(Deinterleave/Interleave, flag=%u)\n", kernel->param2);
@@ -537,16 +590,14 @@ gst_dsp_kernel_stop (GstBaseTransform * trans)
     kernel->dma_allocated = FALSE;
   }
 
-  if (kernel->stft_accumulator) {
-    g_free (kernel->stft_accumulator);
-    kernel->stft_accumulator = NULL;
+  if (kernel->input_buffer) {
+    g_free (kernel->input_buffer);
+    kernel->input_buffer = NULL;
   }
-  kernel->stft_accumulated_samples = 0;
+  kernel->input_buffer_size = 0;
+  kernel->input_buffer_capacity = 0;
 
-  if (kernel->istft_overlap_buffer) {
-    g_free (kernel->istft_overlap_buffer);
-    kernel->istft_overlap_buffer = NULL;
-  }
+  kernel->eos_received = FALSE;
 
   gst_ti_rpmsg_chan_release (kernel->rpmsg_chan);
   kernel->rpmsg_chan = NULL;
@@ -651,7 +702,7 @@ dsp_kernel_send_recv_deint (GstDspKernel * kernel,
   return GST_FLOW_OK;
 }
 
-/* STFT transform with accumulation */
+/* STFT transform with overlap-save chunking */
 static GstFlowReturn
 dsp_kernel_transform_stft (GstDspKernel * kernel, GstBuffer * buf)
 {
@@ -667,116 +718,29 @@ dsp_kernel_transform_stft (GstDspKernel * kernel, GstBuffer * buf)
   GST_DEBUG_OBJECT (kernel, "STFT: Received %zu samples (%zu bytes)",
       incoming_samples, map_info.size);
 
-  /* Accumulate samples */
-  gsize samples_to_copy = MIN (incoming_samples,
-      kernel->stft_total_samples - kernel->stft_accumulated_samples);
-  memcpy (kernel->stft_accumulator + kernel->stft_accumulated_samples,
-      audio_in, samples_to_copy * sizeof (gint16));
-  kernel->stft_accumulated_samples += samples_to_copy;
-
-  GST_LOG_OBJECT (kernel,
-      "STFT: Copied %zu samples, total accumulated: %zu/%zu (%.1f%%)",
-      samples_to_copy, kernel->stft_accumulated_samples,
-      kernel->stft_total_samples,
-      100.0 * kernel->stft_accumulated_samples / kernel->stft_total_samples);
-
-  /* If not enough samples yet, return empty buffer */
-  if (kernel->stft_accumulated_samples < kernel->stft_total_samples) {
-    g_print ("[STFT] Accumulating... %zu/%zu samples (%.1f%%)\n",
-        kernel->stft_accumulated_samples, kernel->stft_total_samples,
-        100.0 * kernel->stft_accumulated_samples / kernel->stft_total_samples);
-    gst_buffer_set_size (buf, 0);
-    gst_buffer_unmap (buf, &map_info);
-    return GST_FLOW_OK;
+  /* Accumulate input buffer */
+  if (kernel->input_buffer_size + incoming_samples >
+      kernel->input_buffer_capacity) {
+    kernel->input_buffer_capacity =
+        kernel->input_buffer_size + incoming_samples + 65536;
+    kernel->input_buffer =
+        (gint16 *) g_realloc (kernel->input_buffer,
+        kernel->input_buffer_capacity * sizeof (gint16));
+    GST_DEBUG_OBJECT (kernel, "STFT: Resized input buffer to %zu samples",
+        kernel->input_buffer_capacity);
   }
 
-  g_print ("[STFT] Processing %zu samples in batches...\n",
-      kernel->stft_total_samples);
+  /* Append input to buffer */
+  memcpy (kernel->input_buffer + kernel->input_buffer_size, audio_in,
+      incoming_samples * sizeof (gint16));
+  kernel->input_buffer_size += incoming_samples;
 
-  /* Calculate batches */
-  guint num_batches =
-      (kernel->window_frames + kernel->batch_size - 1) / kernel->batch_size;
-  gsize out_buf_size = num_batches * kernel->output_buf_size;
-  guint8 *spectral_out = (guint8 *) g_malloc0 (out_buf_size);
-  gsize out_written = 0;
+  GST_DEBUG_OBJECT (kernel, "STFT: Buffered %zu samples, total: %zu",
+      incoming_samples, kernel->input_buffer_size);
 
-  GST_INFO_OBJECT (kernel,
-      "STFT: Processing %u batches (window_frames=%u batch_size=%u)",
-      num_batches, kernel->window_frames, kernel->batch_size);
-
-  /* Process in batches */
-  for (guint batch_idx = 0; batch_idx < num_batches; batch_idx++) {
-    guint frame_start = batch_idx * kernel->batch_size;
-    guint frames_in_batch =
-        MIN (kernel->batch_size, kernel->window_frames - frame_start);
-    gsize batch_samples = frames_in_batch * kernel->hop_size;
-    gsize batch_bytes = batch_samples * sizeof (gint16);
-    gsize sample_offset = frame_start * kernel->hop_size;
-
-    GST_DEBUG_OBJECT (kernel,
-        "STFT: Batch %u/%u - frames=%u samples=%zu bytes=%zu", batch_idx + 1,
-        num_batches, frames_in_batch, batch_samples, batch_bytes);
-    GST_INFO_OBJECT (kernel, "[STFT] Batch %u: in=0x%08x out=0x%08x frames=%u",
-        batch_idx + 1, (uint32_t) kernel->dma_input.phys_addr,
-        (uint32_t) kernel->dma_output.phys_addr, frames_in_batch);
-
-    /* Copy batch to DMA input */
-    dmabuf_sync (kernel->dma_input.dma_buf_fd, DMA_BUF_SYNC_START);
-    memcpy (kernel->dma_input.kern_addr,
-        kernel->stft_accumulator + sample_offset, batch_bytes);
-    dmabuf_sync (kernel->dma_input.dma_buf_fd, DMA_BUF_SYNC_END);
-
-    /* Send to DSP */
-    struct stft_istft_msg req = { }, resp = { };
-    req.hdr.type = kernel->msg_type;
-    req.hdr.seq = kernel->sequence_number++;
-    req.hdr.len = sizeof (req);
-    req.input_buffer = (uint32_t) kernel->dma_input.phys_addr;
-    req.output_buffer = (uint32_t) kernel->dma_output.phys_addr;
-    req.input_frame = frames_in_batch;  /* Number of frames in this batch */
-    req.output_frame = frames_in_batch; /* Must equal input_frame */
-
-    if (dsp_kernel_send_recv_stft (kernel, &req, &resp) != GST_FLOW_OK) {
-      g_free (spectral_out);
-      gst_buffer_unmap (buf, &map_info);
-      return GST_FLOW_ERROR;
-    }
-
-    /* Copy DSP output - calculate size based on frame count and FFT size
-     * Output per frame = (FFT_SIZE/2 + 1) * 2 * sizeof(float)
-     * The *2 is for complex numbers (real + imaginary) */
-    guint bins_per_frame = (kernel->fft_size / 2 + 1) * 2;
-    gsize batch_spectral_bytes =
-        resp.output_frame * bins_per_frame * sizeof (float);
-    GST_DEBUG_OBJECT (kernel, "STFT: Batch %u output: %zu spectral bytes",
-        batch_idx + 1, batch_spectral_bytes);
-    dmabuf_sync (kernel->dma_output.dma_buf_fd, DMA_BUF_SYNC_START);
-    memcpy (spectral_out + out_written, kernel->dma_output.kern_addr,
-        batch_spectral_bytes);
-    dmabuf_sync (kernel->dma_output.dma_buf_fd, DMA_BUF_SYNC_END);
-
-    out_written += batch_spectral_bytes;
-  }
-
-  g_print ("[STFT] Done: %zu samples → %zu spectral bytes\n",
-      kernel->stft_total_samples, out_written);
-  GST_INFO_OBJECT (kernel,
-      "STFT: Complete - input=%zu samples output=%zu bytes",
-      kernel->stft_total_samples, out_written);
-
-  /* Reset accumulator */
-  kernel->stft_accumulated_samples = 0;
-
-  /* Replace buffer contents - unmap first, then replace memory */
+  /* Return empty buffer - processing happens at EOS */
+  gst_buffer_set_size (buf, 0);
   gst_buffer_unmap (buf, &map_info);
-
-  /* Create new memory for the spectral output */
-  GstMemory *new_mem = gst_memory_new_wrapped ((GstMemoryFlags) 0,
-      spectral_out, out_written, 0, out_written, spectral_out, g_free);
-
-  /* Replace buffer memory */
-  gst_buffer_replace_all_memory (buf, new_mem);
-
   return GST_FLOW_OK;
 }
 
@@ -884,13 +848,254 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
       total_spectral_bytes, out_written_samples,
       out_written_samples * sizeof (gint16));
 
-  /* Replace buffer contents - unmap first, then replace memory */
-  gsize output_bytes = out_written_samples * sizeof (gint16);
+  /* Apply overlap-save trimming for this chunk */
+  gsize final_output_samples = out_written_samples;
+  gsize trim_start_samples = 0;
+  gsize trim_end_samples = 0;
+
+  /* Use sequential buffer counting from expected_n_chunks (received via event) */
+  gsize chunk_idx = kernel->chunk_buffer_counter;
+  gsize n_chunks = kernel->expected_n_chunks;
+
+  GST_INFO_OBJECT (kernel,
+      "ISTFT: Sequential buffer count: received_buffer=%zu expected_n_chunks=%zu",
+      chunk_idx, n_chunks);
+  GST_INFO_OBJECT (kernel,
+      "ISTFT: Buffer timestamp: %" GST_TIME_FORMAT " PTS: %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buf)),
+      GST_TIME_ARGS (GST_BUFFER_PTS (buf)));
+
+  /* Check if we're processing chunks (n_chunks > 1 means we're in chunk mode) */
+  if (n_chunks > 1) {
+    GST_INFO_OBJECT (kernel,
+        "ISTFT: Chunk mode detected (n_chunks=%zu). Will apply overlap-save trimming.",
+        n_chunks);
+    /* Apply overlap-save trimming: keep different regions for each chunk
+     * Formula from C reference app:
+     *   lo_sample = (chunk_idx == 0) ? 0 : T_SAMPLES;
+     *   hi_sample = (chunk_idx == n_chunks - 1) ? CHUNK_SAMPLES : CHUNK_SAMPLES - T_SAMPLES;
+     *   keep [lo_sample : hi_sample]
+     */
+    gsize lo_sample, hi_sample;
+
+    if (chunk_idx == 0) {
+      /* First chunk: lo=0, hi=(not last) ? CHUNK_SAMPLES - T_SAMPLES : CHUNK_SAMPLES */
+      lo_sample = 0;
+      hi_sample = (n_chunks == 1) ? kernel->chunk_samples :
+          (kernel->chunk_samples - kernel->t_frames * kernel->hop_size);
+      trim_start_samples = lo_sample;
+      trim_end_samples = kernel->chunk_samples - hi_sample;
+      GST_INFO_OBJECT (kernel,
+          "ISTFT: Chunk %zu (FIRST): Keep [%zu:%zu], trim end %zu samples",
+          chunk_idx, lo_sample, hi_sample, trim_end_samples);
+    } else if (chunk_idx == n_chunks - 1) {
+      /* Last chunk: lo=T_SAMPLES, hi=CHUNK_SAMPLES */
+      lo_sample = kernel->t_frames * kernel->hop_size;
+      hi_sample = kernel->chunk_samples;
+      trim_start_samples = lo_sample;
+      trim_end_samples = kernel->chunk_samples - hi_sample;
+      GST_INFO_OBJECT (kernel,
+          "ISTFT: Chunk %zu (LAST): Keep [%zu:%zu], trim start %zu samples",
+          chunk_idx, lo_sample, hi_sample, trim_start_samples);
+    } else {
+      /* Middle chunks: lo=T_SAMPLES, hi=CHUNK_SAMPLES - T_SAMPLES */
+      lo_sample = kernel->t_frames * kernel->hop_size;
+      hi_sample = kernel->chunk_samples - kernel->t_frames * kernel->hop_size;
+      trim_start_samples = lo_sample;
+      trim_end_samples = kernel->chunk_samples - hi_sample;
+      GST_INFO_OBJECT (kernel,
+          "ISTFT: Chunk %zu (MIDDLE): Keep [%zu:%zu], trim both start=%zu end=%zu",
+          chunk_idx, lo_sample, hi_sample, trim_start_samples,
+          trim_end_samples);
+    }
+
+    if (trim_start_samples > 0 || trim_end_samples > 0) {
+      gsize trimmed_samples =
+          out_written_samples - trim_start_samples - trim_end_samples;
+      if (trimmed_samples > 0) {
+        /* Shift the audio to remove trimmed start samples */
+        if (trim_start_samples > 0) {
+          memmove (audio_out, audio_out + trim_start_samples,
+              trimmed_samples * sizeof (gint16));
+        }
+        final_output_samples = trimmed_samples;
+        GST_INFO_OBJECT (kernel,
+            "ISTFT: Chunk %zu/%zu trim: start=%zu end=%zu | output %zu → %zu samples",
+            chunk_idx + 1, n_chunks, trim_start_samples, trim_end_samples,
+            out_written_samples, final_output_samples);
+      }
+    }
+  }
+
+  /* Note: Padded samples will be trimmed from the FINAL total after all chunks collected,
+   * not from individual chunks. This matches the C reference app's approach. */
+
+  /* If in chunk mode (n_chunks > 1), collect trimmed audio instead of outputting immediately */
+  if (n_chunks > 1) {
+    /* Accumulate this chunk's trimmed audio */
+    gsize needed_size = kernel->collected_audio_size + final_output_samples;
+    if (needed_size > kernel->collected_audio_capacity) {
+      kernel->collected_audio_capacity = needed_size + 65536;
+      kernel->collected_audio = (gint16 *) g_realloc (kernel->collected_audio,
+          kernel->collected_audio_capacity * sizeof (gint16));
+    }
+
+    memcpy (kernel->collected_audio + kernel->collected_audio_size, audio_out,
+        final_output_samples * sizeof (gint16));
+    kernel->collected_audio_size += final_output_samples;
+    kernel->chunks_received++;
+
+    GST_INFO_OBJECT (kernel,
+        "ISTFT: ===== CHUNK %zu/%zu COLLECTED =====", chunk_idx + 1, n_chunks);
+    GST_INFO_OBJECT (kernel,
+        "ISTFT: Chunk %zu/%zu collected: %zu samples trimmed (from %zu original)",
+        chunk_idx + 1, n_chunks, final_output_samples, out_written_samples);
+
+    /* Calculate running total duration and expected chunk timing */
+    gdouble running_duration_sec =
+        (gdouble) kernel->collected_audio_size / 16000.0;
+    guint running_duration_ms = (guint) (running_duration_sec * 1000.0);
+    guint running_minutes = running_duration_ms / 60000;
+    guint running_seconds = (running_duration_ms % 60000) / 1000;
+    guint running_milliseconds = running_duration_ms % 1000;
+
+    /* Calculate expected timing for this chunk */
+    gsize expected_chunk_samples = kernel->hop_samples; /* Each chunk contributes HOP_SAMPLES after trimming */
+    gdouble expected_chunk_duration_sec =
+        (gdouble) expected_chunk_samples / 16000.0;
+    gdouble expected_chunk_end_sec =
+        (chunk_idx + 1) * expected_chunk_duration_sec;
+
+    GST_INFO_OBJECT (kernel,
+        "ISTFT: Running total: %zu samples (%.6f sec / %u:%02u.%03u) collected so far",
+        kernel->collected_audio_size, running_duration_sec, running_minutes,
+        running_seconds, running_milliseconds);
+    GST_INFO_OBJECT (kernel,
+        "ISTFT: Chunk timing - Expected end: %.6f sec, Actual running: %.6f sec (diff: %.6f sec)",
+        expected_chunk_end_sec, running_duration_sec,
+        running_duration_sec - expected_chunk_end_sec);
+
+    /* Increment buffer counter for next chunk */
+    kernel->chunk_buffer_counter++;
+    GST_INFO_OBJECT (kernel,
+        "ISTFT: Incremented buffer counter to %zu (waiting for %zu total)",
+        kernel->chunk_buffer_counter, n_chunks);
+
+    /* If this is the last chunk, output the combined audio */
+    if (kernel->chunks_received == n_chunks) {
+      GST_INFO_OBJECT (kernel,
+          "ISTFT: ===== ALL %zu CHUNKS COLLECTED =====", n_chunks);
+      GST_INFO_OBJECT (kernel,
+          "ISTFT: FINAL OUTPUT: Combining all chunks with total %zu samples before padding trim",
+          kernel->collected_audio_size);
+
+      /* Trim final padding from the total collected audio (matches C reference app) */
+      gsize final_samples = kernel->collected_audio_size;
+      if (kernel->padded_samples_added > 0
+          && final_samples >= kernel->padded_samples_added) {
+        final_samples -= kernel->padded_samples_added;
+        GST_INFO_OBJECT (kernel,
+            "ISTFT: Removing final %zu padded samples. Output: %zu → %zu",
+            kernel->padded_samples_added, kernel->collected_audio_size,
+            final_samples);
+      }
+
+      gsize output_bytes = final_samples * sizeof (gint16);
+
+      /* Log buffer timing information */
+      GST_INFO_OBJECT (kernel,
+          "ISTFT: Output buffer timestamp: %" GST_TIME_FORMAT " duration: %"
+          GST_TIME_FORMAT, GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buf)),
+          GST_TIME_ARGS (GST_BUFFER_DURATION (buf)));
+
+      /* Calculate and log audio duration */
+      gdouble audio_duration_sec = (gdouble) final_samples / 16000.0;   /* 16kHz sample rate */
+      guint audio_duration_ms = (guint) (audio_duration_sec * 1000.0);
+      guint audio_minutes = audio_duration_ms / 60000;
+      guint audio_seconds = (audio_duration_ms % 60000) / 1000;
+      guint audio_milliseconds = audio_duration_ms % 1000;
+
+      GST_INFO_OBJECT (kernel, "ISTFT: Audio output details:");
+      GST_INFO_OBJECT (kernel,
+          "  Total samples (after padding trim): %zu", final_samples);
+      GST_INFO_OBJECT (kernel, "  Total bytes: %zu", output_bytes);
+      GST_INFO_OBJECT (kernel,
+          "  Duration: %u:%02u.%03u (%.6f seconds)",
+          audio_minutes, audio_seconds, audio_milliseconds, audio_duration_sec);
+
+      g_print ("[ISTFT] FINAL AUDIO OUTPUT LENGTH (after padding trim):\n");
+      g_print ("  Samples: %zu\n", final_samples);
+      g_print ("  Bytes: %zu\n", output_bytes);
+      g_print ("  Duration: %u:%02u.%03u (%u ms, %.6f sec @ 16kHz)\n",
+          audio_minutes, audio_seconds, audio_milliseconds, audio_duration_ms,
+          audio_duration_sec);
+
+      gst_buffer_unmap (buf, &map_info);
+
+      /* Create new memory with collected audio (trimmed to final_samples) */
+      GstMemory *new_mem = gst_memory_new_wrapped ((GstMemoryFlags) 0,
+          kernel->collected_audio, output_bytes, 0, output_bytes,
+          kernel->collected_audio, g_free);
+
+      gst_buffer_remove_all_memory (buf);
+      gst_buffer_append_memory (buf, new_mem);
+      gst_buffer_set_size (buf, output_bytes);
+
+      /* Reset for next sequence */
+      kernel->collected_audio = NULL;
+      kernel->collected_audio_size = 0;
+      kernel->collected_audio_capacity = 0;
+      kernel->chunks_received = 0;
+      kernel->chunk_buffer_counter = 0;
+      kernel->expected_n_chunks = 0;
+
+      return GST_FLOW_OK;
+    } else {
+      /* Not the last chunk yet - consume buffer without outputting */
+      GST_INFO_OBJECT (kernel,
+          "ISTFT: Chunk %zu/%zu waiting for more chunks... (received %zu/%zu)",
+          chunk_idx + 1, n_chunks, kernel->chunks_received, n_chunks);
+
+      gst_buffer_unmap (buf, &map_info);
+      gst_buffer_set_size (buf, 0);
+      g_free (audio_out);
+      return GST_FLOW_OK;
+    }
+  }
+
+  /* Non-chunk mode: output immediately */
+  gsize output_bytes = final_output_samples * sizeof (gint16);
+
+  /* Calculate and log audio duration for non-chunk mode */
+  gdouble audio_duration_sec = (gdouble) final_output_samples / 16000.0;        /* 16kHz sample rate */
+  guint audio_duration_ms = (guint) (audio_duration_sec * 1000.0);
+  guint audio_minutes = audio_duration_ms / 60000;
+  guint audio_seconds = (audio_duration_ms % 60000) / 1000;
+  guint audio_milliseconds = audio_duration_ms % 1000;
+
+  GST_INFO_OBJECT (kernel,
+      "ISTFT: Non-chunk mode (or unknown): Outputting %zu samples immediately",
+      final_output_samples);
+  GST_INFO_OBJECT (kernel, "ISTFT: Audio output details (single buffer):");
+  GST_INFO_OBJECT (kernel, "  Total samples: %zu", final_output_samples);
+  GST_INFO_OBJECT (kernel, "  Total bytes: %zu", output_bytes);
+  GST_INFO_OBJECT (kernel,
+      "  Duration: %u:%02u.%03u (%.6f seconds)",
+      audio_minutes, audio_seconds, audio_milliseconds, audio_duration_sec);
+
+  g_print ("[ISTFT] SINGLE BUFFER OUTPUT LENGTH:\n");
+  g_print ("  Samples: %zu\n", final_output_samples);
+  g_print ("  Bytes: %zu\n", output_bytes);
+  g_print ("  Duration: %u:%02u.%03u (%u ms, %.6f sec @ 16kHz)\n",
+      audio_minutes, audio_seconds, audio_milliseconds, audio_duration_ms,
+      audio_duration_sec);
+
   gst_buffer_unmap (buf, &map_info);
 
-  /* Create new memory for the audio output */
+  /* Create new memory for the audio output (only final_output_samples) */
   GstMemory *new_mem = gst_memory_new_wrapped ((GstMemoryFlags) 0,
-      audio_out, output_bytes, 0, output_bytes, audio_out, g_free);
+      audio_out, final_output_samples * sizeof (gint16), 0, output_bytes,
+      audio_out, g_free);
 
   /* Replace buffer memory */
   gst_buffer_replace_all_memory (buf, new_mem);
@@ -961,8 +1166,8 @@ dsp_kernel_transform_deint_interleave (GstDspKernel * kernel, GstBuffer * buf)
 
   g_print ("[%s] Sending RPMsg to DSP:\n", op_name);
   g_print ("  Message type:    0x%04x (response: 0x%04x)\n", req.hdr.type,
-      kernel->msg_resp_type ? kernel->
-      msg_resp_type : ((kernel->msg_type & 0x0FFF) | 0x2000));
+      kernel->msg_resp_type ? kernel->msg_resp_type : ((kernel->
+              msg_type & 0x0FFF) | 0x2000));
   g_print ("  Input buffer:    0x%08x (phys)\n", req.input_buffer);
   g_print ("  Output buffer:   0x%08x (phys)\n", req.output_buffer);
   g_print ("  Input frames:    %u\n", req.input_frame);
@@ -1005,6 +1210,276 @@ dsp_kernel_transform_deint_interleave (GstDspKernel * kernel, GstBuffer * buf)
   return GST_FLOW_OK;
 }
 
+/* Helper: Process all chunks with overlap-save
+ * Each chunk outputs FULL spectral data (WINDOW_FRAMES spectral frames)
+ * Trimming of audio output happens in ISTFT or downstream, not here */
+static GstFlowReturn
+dsp_kernel_process_chunks (GstDspKernel * kernel, GstBaseTransform * trans)
+{
+  gsize n_samples = kernel->input_buffer_size;
+
+  /* Calculate number of chunks using overlap-save strategy */
+  gsize n_chunks;
+  if (n_samples <= kernel->chunk_samples) {
+    n_chunks = 1;
+  } else {
+    n_chunks = 1 + (gsize) ceil ((double) (n_samples - kernel->chunk_samples) /
+        (double) kernel->hop_samples);
+  }
+
+  /* Store chunk information for trimming in ISTFT */
+  kernel->n_chunks = n_chunks;
+  kernel->chunking_in_progress = TRUE;
+
+  /* Calculate padded length */
+  kernel->total_padded_len =
+      (n_chunks - 1) * kernel->hop_samples + kernel->chunk_samples;
+  kernel->padded_samples_added = kernel->total_padded_len - n_samples;
+
+  GST_INFO_OBJECT (kernel, "========== STFT CHUNK PROCESSING START ==========");
+  GST_INFO_OBJECT (kernel,
+      "STFT: Input audio: %zu samples (%.2f sec @ 16kHz)", n_samples,
+      n_samples / 16000.0);
+  GST_INFO_OBJECT (kernel, "STFT: Overlap-save chunking: n_chunks=%zu",
+      n_chunks);
+  GST_INFO_OBJECT (kernel,
+      "STFT: Padding: total_padded_len=%zu padding_added=%zu",
+      kernel->total_padded_len, kernel->padded_samples_added);
+  GST_INFO_OBJECT (kernel,
+      "STFT: Chunk parameters: chunk_samples=%zu hop_samples=%zu overlap_frames=%zu t_frames=%zu",
+      kernel->chunk_samples, kernel->hop_samples, kernel->overlap_frames,
+      kernel->t_frames);
+
+  /* Pad the buffer */
+  gint16 *padded_audio =
+      (gint16 *) g_malloc0 (kernel->total_padded_len * sizeof (gint16));
+  memcpy (padded_audio, kernel->input_buffer, n_samples * sizeof (gint16));
+
+  /* Calculate spectral output parameters - same for all chunks */
+  guint bins_per_frame = (kernel->fft_size / 2 + 1) * 2;
+  gsize bytes_per_frame = bins_per_frame * sizeof (float);
+  gsize bytes_per_chunk = kernel->window_frames * bytes_per_frame;
+
+  GstPad *srcpad = gst_element_get_static_pad (GST_ELEMENT (trans), "src");
+
+  /* Send custom event downstream BEFORE pushing chunks with overlap-save parameters */
+  GstEvent *chunk_event = gst_event_new_custom (GST_EVENT_CUSTOM_DOWNSTREAM,
+      gst_structure_new ("ti-overlap-save-chunk-count",
+          "n_chunks", G_TYPE_UINT, (guint) n_chunks,
+          "t_frames", G_TYPE_UINT, (guint) kernel->t_frames,
+          "hop_size", G_TYPE_UINT, (guint) kernel->hop_size,
+          "chunk_samples", G_TYPE_UINT64, (guint64) kernel->chunk_samples,
+          "padded_samples_added", G_TYPE_UINT64,
+          (guint64) kernel->padded_samples_added,
+          NULL));
+
+  gboolean event_ret = gst_pad_push_event (srcpad, chunk_event);
+  GST_INFO_OBJECT (kernel,
+      "STFT: Sent chunk count event BEFORE processing (n_chunks=%zu, t_frames=%zu, hop_size=%u, event_sent=%d)",
+      n_chunks, kernel->t_frames, kernel->hop_size, event_ret);
+
+  /* Process each chunk and push immediately (one chunk at a time to downstream) */
+  for (gsize chunk_idx = 0; chunk_idx < n_chunks; chunk_idx++) {
+    gsize chunk_offset = chunk_idx * kernel->hop_samples;
+    gint16 *chunk_input = padded_audio + chunk_offset;
+
+    GST_INFO_OBJECT (kernel,
+        "STFT: ===== CHUNK %zu/%zu START =====", chunk_idx + 1, n_chunks);
+    GST_INFO_OBJECT (kernel,
+        "STFT: Chunk %zu/%zu: audio offset=%zu samples, input from [%zu:%zu]",
+        chunk_idx + 1, n_chunks, chunk_offset, chunk_offset,
+        chunk_offset + kernel->chunk_samples);
+    GST_INFO_OBJECT (kernel,
+        "STFT: Parameters: hop_size=%u fft_size=%u window_frames=%u batch_size=%u",
+        kernel->hop_size, kernel->fft_size, kernel->window_frames,
+        kernel->batch_size);
+    GST_INFO_OBJECT (kernel,
+        "STFT: Overlap-save params: overlap_frames=%zu t_frames=%zu hop_frames=%zu hop_samples=%zu",
+        kernel->overlap_frames, kernel->t_frames, kernel->hop_frames,
+        kernel->hop_samples);
+
+    /* Allocate buffer for this chunk's spectral data */
+    guint8 *chunk_spectral = (guint8 *) g_malloc0 (bytes_per_chunk);
+    gsize chunk_offset_bytes = 0;
+
+    /* Process this chunk in batches */
+    guint num_batches =
+        (kernel->window_frames + kernel->batch_size - 1) / kernel->batch_size;
+
+    for (guint batch_idx = 0; batch_idx < num_batches; batch_idx++) {
+      guint frame_start = batch_idx * kernel->batch_size;
+      guint frames_in_batch = MIN (kernel->batch_size,
+          kernel->window_frames - frame_start);
+      gsize batch_samples = frames_in_batch * kernel->hop_size;
+      gsize batch_bytes = batch_samples * sizeof (gint16);
+      gsize sample_offset = frame_start * kernel->hop_size;
+
+      GST_DEBUG_OBJECT (kernel,
+          "STFT: Chunk %zu Batch %u/%u - frames=%u samples=%zu",
+          chunk_idx + 1, batch_idx + 1, num_batches, frames_in_batch,
+          batch_samples);
+
+      /* Copy batch to DMA input */
+      dmabuf_sync (kernel->dma_input.dma_buf_fd, DMA_BUF_SYNC_START);
+      memcpy (kernel->dma_input.kern_addr, chunk_input + sample_offset,
+          batch_bytes);
+      dmabuf_sync (kernel->dma_input.dma_buf_fd, DMA_BUF_SYNC_END);
+
+      /* Send to DSP */
+      struct stft_istft_msg req = { }, resp = { };
+      req.hdr.type = kernel->msg_type;
+      req.hdr.seq = kernel->sequence_number++;
+      req.hdr.len = sizeof (req);
+      req.input_buffer = (uint32_t) kernel->dma_input.phys_addr;
+      req.output_buffer = (uint32_t) kernel->dma_output.phys_addr;
+      req.input_frame = frames_in_batch;
+      req.output_frame = frames_in_batch;
+
+      if (dsp_kernel_send_recv_stft (kernel, &req, &resp) != GST_FLOW_OK) {
+        GST_ERROR_OBJECT (kernel, "STFT: Batch %u failed for chunk %zu",
+            batch_idx + 1, chunk_idx + 1);
+        g_free (padded_audio);
+        g_free (chunk_spectral);
+        gst_object_unref (srcpad);
+        return GST_FLOW_ERROR;
+      }
+
+      /* Copy DSP output */
+      guint out_bins_per_frame = (kernel->fft_size / 2 + 1) * 2;
+      gsize batch_spectral_bytes =
+          resp.output_frame * out_bins_per_frame * sizeof (float);
+
+      GST_DEBUG_OBJECT (kernel, "STFT: Chunk %zu Batch %u output: %zu bytes",
+          chunk_idx + 1, batch_idx + 1, batch_spectral_bytes);
+      dmabuf_sync (kernel->dma_output.dma_buf_fd, DMA_BUF_SYNC_START);
+      memcpy (chunk_spectral + chunk_offset_bytes, kernel->dma_output.kern_addr,
+          batch_spectral_bytes);
+      dmabuf_sync (kernel->dma_output.dma_buf_fd, DMA_BUF_SYNC_END);
+      chunk_offset_bytes += batch_spectral_bytes;
+    }
+
+    /* Push this chunk's spectral output immediately */
+    GstMemory *chunk_mem = gst_memory_new_wrapped ((GstMemoryFlags) 0,
+        chunk_spectral, bytes_per_chunk, 0, bytes_per_chunk,
+        chunk_spectral, g_free);
+
+    GstBuffer *chunk_buf = gst_buffer_new ();
+    gst_buffer_append_memory (chunk_buf, chunk_mem);
+
+    /* Encode chunk metadata into buffer for ISTFT to access */
+    /* Use offset field to store: (chunk_idx << 16) | n_chunks */
+    guint32 chunk_meta = ((chunk_idx & 0xFFFF) << 16) | (n_chunks & 0xFFFF);
+    GST_BUFFER_OFFSET (chunk_buf) = (guint64) chunk_meta;
+    GST_BUFFER_FLAG_SET (chunk_buf, GST_BUFFER_FLAG_MARKER);
+
+    GST_INFO_OBJECT (kernel,
+        "STFT: Pushing chunk %zu/%zu spectral data: %zu bytes (meta=0x%08x)",
+        chunk_idx + 1, n_chunks, bytes_per_chunk, chunk_meta);
+    GST_INFO_OBJECT (kernel,
+        "STFT: Chunk %zu: Expected to be trimmed by ISTFT as: [idx=%zu/%zu]",
+        chunk_idx + 1, chunk_idx, n_chunks);
+
+    GstFlowReturn push_ret = gst_pad_push (srcpad, chunk_buf);
+    if (push_ret != GST_FLOW_OK) {
+      GST_ERROR_OBJECT (kernel,
+          "STFT: Failed to push chunk %zu spectral output: %s",
+          chunk_idx + 1, gst_flow_get_name (push_ret));
+      g_free (padded_audio);
+      gst_object_unref (srcpad);
+      return push_ret;
+    }
+    GST_INFO_OBJECT (kernel,
+        "STFT: ===== CHUNK %zu/%zu END (pushed) =====", chunk_idx + 1,
+        n_chunks);
+  }
+
+  g_free (padded_audio);
+  gst_object_unref (srcpad);
+
+  GST_INFO_OBJECT (kernel,
+      "========== STFT CHUNK PROCESSING COMPLETE ==========");
+  GST_INFO_OBJECT (kernel,
+      "STFT: All %zu chunks processed and pushed downstream", n_chunks);
+  GST_INFO_OBJECT (kernel,
+      "STFT: Now waiting for ISTFT to collect and output combined audio...");
+
+  return GST_FLOW_OK;
+}
+
+/* Sink event handler for EOS - triggers chunk processing */
+static gboolean
+gst_dsp_kernel_sink_event (GstBaseTransform * trans, GstEvent * event)
+{
+  GstDspKernel *kernel = GST_DSP_KERNEL (trans);
+
+  /* Handle custom chunk count event from STFT (for ISTFT to use) */
+  if (GST_EVENT_TYPE (event) == GST_EVENT_CUSTOM_DOWNSTREAM) {
+    const GstStructure *structure = gst_event_get_structure (event);
+    if (gst_structure_has_name (structure, "ti-overlap-save-chunk-count")) {
+      guint32 n_chunks = 0;
+      guint32 t_frames = 0;
+      guint32 hop_size = 0;
+      guint64 chunk_samples = 0;
+      guint64 padded_samples_added = 0;
+
+      if (gst_structure_get_uint (structure, "n_chunks", &n_chunks)) {
+        kernel->expected_n_chunks = n_chunks;
+        kernel->chunk_buffer_counter = 0;
+
+        /* Extract overlap-save parameters for trimming calculations */
+        gst_structure_get_uint (structure, "t_frames", &t_frames);
+        gst_structure_get_uint (structure, "hop_size", &hop_size);
+        gst_structure_get_uint64 (structure, "chunk_samples", &chunk_samples);
+        gst_structure_get_uint64 (structure, "padded_samples_added",
+            &padded_samples_added);
+
+        /* Set these in kernel for ISTFT trimming */
+        kernel->t_frames = t_frames;
+        kernel->hop_size = hop_size;
+        kernel->chunk_samples = chunk_samples;
+        kernel->padded_samples_added = padded_samples_added;
+
+        GST_INFO_OBJECT (kernel, "ISTFT: Received chunk count event:");
+        GST_INFO_OBJECT (kernel,
+            "  n_chunks=%u t_frames=%u hop_size=%u chunk_samples=%zu padded=%zu",
+            n_chunks, t_frames, hop_size, (gsize) chunk_samples,
+            (gsize) padded_samples_added);
+      }
+    }
+  }
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_EOS) {
+    GST_INFO_OBJECT (kernel, "EOS event received");
+    GST_INFO_OBJECT (kernel, "  msg_type=0x%04x (DSP_OP_STFT=0x%04x)",
+        kernel->msg_type, DSP_OP_STFT);
+    GST_INFO_OBJECT (kernel, "  input_buffer_size=%zu",
+        kernel->input_buffer_size);
+    kernel->eos_received = TRUE;
+
+    /* Trigger overlap-save chunk processing for STFT */
+    if (kernel->msg_type == DSP_OP_STFT && kernel->input_buffer_size > 0) {
+      GST_INFO_OBJECT (kernel,
+          "STFT: Processing %zu buffered audio samples with overlap-save chunking",
+          kernel->input_buffer_size);
+
+      GstFlowReturn ret = dsp_kernel_process_chunks (kernel, trans);
+      if (ret != GST_FLOW_OK) {
+        GST_ERROR_OBJECT (kernel, "STFT: Chunk processing failed");
+        return FALSE;           /* Let EOS propagate even on error */
+      }
+
+      GST_INFO_OBJECT (kernel, "STFT: Chunk processing complete");
+    } else {
+      GST_INFO_OBJECT (kernel,
+          "STFT: Skipping chunk processing (msg_type match=%d, has data=%d)",
+          kernel->msg_type == DSP_OP_STFT, kernel->input_buffer_size > 0);
+    }
+  }
+
+  /* Chain up to parent class event handler */
+  return GST_BASE_TRANSFORM_CLASS (parent_class)->sink_event (trans, event);
+}
+
 static GstFlowReturn
 gst_dsp_kernel_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 {
@@ -1031,6 +1506,9 @@ gst_dsp_kernel_transform_caps (GstBaseTransform * trans,
 {
   GstDspKernel *kernel = GST_DSP_KERNEL (trans);
   GstCaps *ret = NULL;
+
+  /* Ensure auto-detection has been done (should already be done in init) */
+  gst_dsp_kernel_auto_detect_operation (kernel);
 
   GST_DEBUG_OBJECT (kernel,
       "transform_caps: direction=%s, msg_type=0x%04x, caps=%" GST_PTR_FORMAT,

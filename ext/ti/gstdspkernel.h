@@ -87,7 +87,6 @@ typedef struct _GstDspKernelClass GstDspKernelClass;
 
 /* DSP operation types */
 typedef enum {
-    DSP_OP_PASSTHROUGH    = 0x0000,  /* No operation */
     DSP_OP_STFT           = 0x1020,  /* STFT analysis (requires accumulation) */
     DSP_OP_ISTFT          = 0x1030,  /* ISTFT synthesis (requires overlap-add) */
     DSP_OP_DEINT_INTERLEAVE = 0x1040,  /* Deinterleave/Interleave (param2=flag: 0=deinterleave, 1=interleave) */
@@ -119,14 +118,38 @@ struct _GstDspKernel {
     struct dma_buf_params dma_output;
     gboolean        dma_allocated;
 
-    /* STFT-specific state (accumulation) */
-    gint16  *stft_accumulator;
-    gsize    stft_accumulated_samples;
-    gsize    stft_total_samples;
 
-    /* ISTFT-specific state (overlap-add) */
-    gfloat  *istft_overlap_buffer;
-    gsize    istft_overlap_samples;
+    /* Overlap-save chunking state */
+    gint16  *input_buffer;               /* Buffer all audio until EOS */
+    gsize    input_buffer_size;          /* Total input samples buffered */
+    gsize    input_buffer_capacity;      /* Allocated capacity */
+
+    /* Overlap-save parameters (calculated from window_frames, hop_size, batch_size) */
+    gsize    overlap_frames;             /* OVERLAP_FRAMES = 100 */
+    gsize    t_frames;                   /* T_FRAMES = overlap_frames / 2 = 50 */
+    gsize    hop_frames;                 /* HOP_FRAMES = window_frames - overlap_frames */
+    gsize    hop_samples;                /* HOP_SAMPLES = hop_frames * hop_size */
+    gsize    chunk_samples;              /* CHUNK_SAMPLES = window_frames * hop_size */
+
+    /* Chunking state */
+    gsize    n_chunks;                   /* Total chunks to process */
+    gsize    total_padded_len;           /* Total padded length needed */
+    gsize    padded_samples_added;       /* Padding added at end */
+    gboolean chunking_in_progress;       /* Processing chunks */
+
+    /* EOS and output trimming */
+    gboolean eos_received;               /* EOS event received */
+
+    /* Chunk collection for overlap-save reconstruction */
+    gint16  *collected_audio;            /* Collected trimmed audio from all chunks */
+    gsize    collected_audio_size;       /* Total samples collected */
+    gsize    collected_audio_capacity;   /* Allocated capacity */
+    gsize    chunks_received;            /* Number of chunks received in ISTFT */
+
+    /* Chunk count from upstream (received via event) */
+    gsize    expected_n_chunks;          /* Number of chunks expected from STFT */
+    gsize    chunk_buffer_counter;       /* Sequential counter for each buffer in ISTFT */
+
 };
 
 struct _GstDspKernelClass {

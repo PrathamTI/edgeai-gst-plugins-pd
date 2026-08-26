@@ -108,7 +108,6 @@ struct _GstTiTvm
     gchar *input_shape;           /* Input tensor shape (e.g., "1,2,401,161") */
     gint iterations;              /* Number of inference iterations */
     gboolean benchmark;           /* Enable performance benchmarking */
-    gboolean audio_mode;          /* Enable audio enhancement mode (deinterleave/interleave) */
     gchar *rproc_device;          /* Remoteproc device for RPMsg */
     guint rproc_id;               /* Remote processor core ID (8 = C7x_0 on AM62D) */
     guint remote_ep;              /* RPMsg endpoint number */
@@ -124,14 +123,6 @@ struct _GstTiTvm
     void *auto_input_shape;       /* std::vector<int64_t>* */
     void *auto_output_shape;      /* std::vector<int64_t>* */
     gchar *auto_input_name;
-
-    /* Audio mode: RPMsg context and DMA buffers */
-    void *rpmsg_ctx;              /* Shared RPMsg context (GstTiRpmsgCtx*) */
-    void *dma_input;              /* DMA buffer for interleaved input (struct dma_buf_params*) */
-    void *dma_deint;              /* DMA buffer for deinterleaved data (struct dma_buf_params*) */
-    void *dma_inter;              /* DMA buffer for interleaved output (struct dma_buf_params*) */
-    gboolean dma_allocated;       /* DMA buffers allocated flag */
-    guint32 sequence_number;      /* RPMsg sequence number */
 
     /* Input/output data */
     void *final_output;           /* Final inference output buffer */
@@ -161,7 +152,6 @@ enum
     PROP_INPUT_SHAPE,
     PROP_ITERATIONS,
     PROP_BENCHMARK,
-    PROP_AUDIO_MODE,
     PROP_RPROC_DEVICE,
     PROP_RPROC_ID,
     PROP_REMOTE_EP
@@ -172,13 +162,9 @@ enum
 #define DEFAULT_INPUT_SHAPE ""
 #define DEFAULT_ITERATIONS 1
 #define DEFAULT_BENCHMARK TRUE
-#define DEFAULT_AUDIO_MODE FALSE
 #define DEFAULT_RPROC_DEVICE "/dev/remoteproc0"
 #define DEFAULT_RPROC_ID 8
 #define DEFAULT_REMOTE_EP 13
-
-/* Audio mode DMA buffer sizes (for 401 frames × 161 bins × 2 channels × float) */
-#define TVM_AUDIO_BUFFER_SIZE 516488  /* 401 * 161 * 2 * 4 bytes */
 
 G_END_DECLS
 
