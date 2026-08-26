@@ -103,8 +103,6 @@ struct _GstDspKernel {
     guint    msg_resp_type;
     guint    input_buf_size;
     guint    output_buf_size;
-    guint    param0;
-    guint    param1;
     guint    param2;
     guint    hop_size;          /* For STFT/ISTFT */
     guint    fft_size;          /* For STFT/ISTFT */

@@ -106,11 +106,7 @@ struct _GstTiTvm
     /* Properties */
     gchar *model_path;            /* Path to TVM artifacts directory */
     gchar *input_shape;           /* Input tensor shape (e.g., "1,2,401,161") */
-    gint iterations;              /* Number of inference iterations */
     gboolean benchmark;           /* Enable performance benchmarking */
-    gchar *rproc_device;          /* Remoteproc device for RPMsg */
-    guint rproc_id;               /* Remote processor core ID (8 = C7x_0 on AM62D) */
-    guint remote_ep;              /* RPMsg endpoint number */
 
     /* TVM runtime state */
     gboolean tvm_initialized;     /* TVM runtime initialization status */
@@ -133,7 +129,6 @@ struct _GstTiTvm
 
     /* Execution state */
     gboolean inference_completed; /* Whether inference has run */
-    gint current_iteration;       /* Current iteration number */
 };
 
 struct _GstTiTvmClass
@@ -150,21 +145,13 @@ enum
     PROP_0,
     PROP_MODEL_PATH,
     PROP_INPUT_SHAPE,
-    PROP_ITERATIONS,
-    PROP_BENCHMARK,
-    PROP_RPROC_DEVICE,
-    PROP_RPROC_ID,
-    PROP_REMOTE_EP
+    PROP_BENCHMARK
 };
 
 /* Default values */
 #define DEFAULT_MODEL_PATH ""
 #define DEFAULT_INPUT_SHAPE ""
-#define DEFAULT_ITERATIONS 1
 #define DEFAULT_BENCHMARK TRUE
-#define DEFAULT_RPROC_DEVICE "/dev/remoteproc0"
-#define DEFAULT_RPROC_ID 8
-#define DEFAULT_REMOTE_EP 13
 
 G_END_DECLS
 

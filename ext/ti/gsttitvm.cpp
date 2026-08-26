@@ -173,9 +173,6 @@ static
 gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm,
     gfloat * input_data, gsize input_size);
 
-static void
-gst_ti_tvm_print_performance_stats (GstTiTvm * tvm);
-
 static gchar *
 gst_ti_tvm_load_json_file (const gchar * file_path);
 
@@ -258,32 +255,9 @@ gst_ti_tvm_class_init (GstTiTvmClass * klass)
           DEFAULT_INPUT_SHAPE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
-  g_object_class_install_property (gobject_class, PROP_ITERATIONS,
-      g_param_spec_int ("iterations", "Iterations",
-          "Number of inference iterations to run", 1, 1000, DEFAULT_ITERATIONS,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
   g_object_class_install_property (gobject_class, PROP_BENCHMARK,
       g_param_spec_boolean ("benchmark", "Benchmark",
           "Enable performance benchmarking output", DEFAULT_BENCHMARK,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_RPROC_DEVICE,
-      g_param_spec_string ("rproc-device", "Remoteproc Device",
-          "Remoteproc cdev for DMA buffer physical address lookup",
-          DEFAULT_RPROC_DEVICE,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_RPROC_ID,
-      g_param_spec_uint ("rproc-id", "Remote Processor ID",
-          "Linux remoteproc core ID (8 = C7x_0 on AM62D)",
-          0, G_MAXUINT, DEFAULT_RPROC_ID,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_REMOTE_EP,
-      g_param_spec_uint ("remote-ep", "Remote RPMsg Endpoint",
-          "RPMsg endpoint number running DSP firmware",
-          0, G_MAXUINT, DEFAULT_REMOTE_EP,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
@@ -292,11 +266,7 @@ gst_ti_tvm_init (GstTiTvm * tvm)
 {
   tvm->model_path = g_strdup (DEFAULT_MODEL_PATH);
   tvm->input_shape = g_strdup (DEFAULT_INPUT_SHAPE);
-  tvm->iterations = DEFAULT_ITERATIONS;
   tvm->benchmark = DEFAULT_BENCHMARK;
-  tvm->rproc_device = g_strdup (DEFAULT_RPROC_DEVICE);
-  tvm->rproc_id = DEFAULT_RPROC_ID;
-  tvm->remote_ep = DEFAULT_REMOTE_EP;
 
   tvm->tvm_initialized = FALSE;
   tvm->graph_executor = NULL;
@@ -314,7 +284,6 @@ gst_ti_tvm_init (GstTiTvm * tvm)
   memset (&tvm->perf_data, 0, sizeof (tvm->perf_data));
 
   tvm->inference_completed = FALSE;
-  tvm->current_iteration = 0;
 }
 
 static void
@@ -334,21 +303,8 @@ gst_ti_tvm_set_property (GObject * object, guint property_id,
       g_free (tvm->input_shape);
       tvm->input_shape = g_value_dup_string (value);
       break;
-    case PROP_ITERATIONS:
-      tvm->iterations = g_value_get_int (value);
-      break;
     case PROP_BENCHMARK:
       tvm->benchmark = g_value_get_boolean (value);
-      break;
-    case PROP_RPROC_DEVICE:
-      g_free (tvm->rproc_device);
-      tvm->rproc_device = g_value_dup_string (value);
-      break;
-    case PROP_RPROC_ID:
-      tvm->rproc_id = g_value_get_uint (value);
-      break;
-    case PROP_REMOTE_EP:
-      tvm->remote_ep = g_value_get_uint (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -372,20 +328,8 @@ gst_ti_tvm_get_property (GObject * object, guint property_id,
     case PROP_INPUT_SHAPE:
       g_value_set_string (value, tvm->input_shape);
       break;
-    case PROP_ITERATIONS:
-      g_value_set_int (value, tvm->iterations);
-      break;
     case PROP_BENCHMARK:
       g_value_set_boolean (value, tvm->benchmark);
-      break;
-    case PROP_RPROC_DEVICE:
-      g_value_set_string (value, tvm->rproc_device);
-      break;
-    case PROP_RPROC_ID:
-      g_value_set_uint (value, tvm->rproc_id);
-      break;
-    case PROP_REMOTE_EP:
-      g_value_set_uint (value, tvm->remote_ep);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -410,7 +354,6 @@ gst_ti_tvm_finalize (GObject * object)
 
   g_free (tvm->model_path);
   g_free (tvm->input_shape);
-  g_free (tvm->rproc_device);
   g_free (tvm->auto_input_name);
 
   if (tvm->auto_input_shape) {
@@ -445,8 +388,8 @@ gst_ti_tvm_start (GstBaseTransform * trans)
     return FALSE;
   }
 
-  /* Allocate performance tracking arrays */
-  tvm->perf_data.inference_times = g_new0 (gint64, tvm->iterations);
+  /* Performance tracking (single run only) */
+  tvm->perf_data.inference_times = g_new0 (gint64, 1);
 
   GST_DEBUG_OBJECT (tvm, "TI TVM element started successfully");
 
@@ -811,7 +754,7 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
           input_size);
     }
 
-    /* Create input NDArray once (reused across iterations) */
+    /* Create input NDArray */
     NDArray input_array = NDArray::Empty (shape, DLDataType {
           kDLFloat, 32, 1
         }, DLDevice {
@@ -821,67 +764,48 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
     input_array.CopyFromBytes (input_data, input_size * sizeof (float));
 
     if (tvm->benchmark) {
-      g_print ("\n[TVM] Running inference benchmark (%d iterations)...\n",
-          tvm->iterations);
+      g_print ("\n[TVM] Running inference...\n");
       g_print ("------------------------------\n");
     }
 
-    /* Run inference iterations */
-    for (gint i = 0; i < tvm->iterations; i++) {
-      auto start_time = std::chrono::high_resolution_clock::now ();
+    /* Run single inference */
+    auto start_time = std::chrono::high_resolution_clock::now ();
 
-      (*set_input) (0, input_array);
-      (*run) ();
-      NDArray output_array = (*get_output) (0);
+    (*set_input) (0, input_array);
+    (*run) ();
+    NDArray output_array = (*get_output) (0);
 
-      auto end_time = std::chrono::high_resolution_clock::now ();
-      auto duration =
-          std::chrono::duration_cast < std::chrono::microseconds >
-          (end_time - start_time);
-      gdouble time_ms = duration.count () / 1000.0;
+    auto end_time = std::chrono::high_resolution_clock::now ();
+    auto duration =
+        std::chrono::duration_cast < std::chrono::microseconds >
+        (end_time - start_time);
+    gdouble time_ms = duration.count () / 1000.0;
 
-      if (i == 0) {
-        /* First run includes initialization overhead */
-        tvm->perf_data.first_run_time = duration.count ();
-        if (tvm->benchmark) {
-          g_print ("First run (includes init): %.2f ms\n", time_ms);
-        }
-
-        /* Get output shape from first run */
-        gsize out_floats = 1;
-        for (int j = 0; j < output_array->ndim; j++) {
-          out_floats *= output_array->shape[j];
-        }
-        tvm->output_num_floats = out_floats;
-
-        if (tvm->benchmark) {
-          g_print ("Output shape: (");
-          for (int j = 0; j < output_array->ndim; j++) {
-            g_print ("%s%ld", (j > 0) ? ", " : "", output_array->shape[j]);
-          }
-          g_print (")\n");
-        }
-      } else {
-        /* Subsequent runs for performance measurement */
-        tvm->perf_data.inference_times[i - 1] = duration.count ();
-        if (tvm->benchmark) {
-          g_print ("Run %d: %.2f ms\n", i + 1, time_ms);
-        }
-      }
-
-      /* Store final output for returning to pipeline */
-      if (i == tvm->iterations - 1) {
-        if (tvm->final_output) {
-          delete (NDArray *) tvm->final_output;
-        }
-        tvm->final_output = new NDArray (output_array);
-      }
+    tvm->perf_data.first_run_time = duration.count ();
+    if (tvm->benchmark) {
+      g_print ("Inference time: %.2f ms\n", time_ms);
     }
 
-    /* Calculate and print performance statistics */
-    if (tvm->benchmark && tvm->iterations > 1) {
-      gst_ti_tvm_print_performance_stats (tvm);
+    /* Get output shape */
+    gsize out_floats = 1;
+    for (int j = 0; j < output_array->ndim; j++) {
+      out_floats *= output_array->shape[j];
     }
+    tvm->output_num_floats = out_floats;
+
+    if (tvm->benchmark) {
+      g_print ("Output shape: (");
+      for (int j = 0; j < output_array->ndim; j++) {
+        g_print ("%s%ld", (j > 0) ? ", " : "", output_array->shape[j]);
+      }
+      g_print (")\n");
+    }
+
+    /* Store output for returning to pipeline */
+    if (tvm->final_output) {
+      delete (NDArray *) tvm->final_output;
+    }
+    tvm->final_output = new NDArray (output_array);
 
     tvm->inference_completed = TRUE;
     return GST_FLOW_OK;
@@ -892,49 +816,6 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
     GST_ERROR_OBJECT (tvm, "Inference benchmark failed: %s", e.what ());
     return GST_FLOW_ERROR;
   }
-}
-
-static void
-gst_ti_tvm_print_performance_stats (GstTiTvm * tvm)
-{
-  gint num_runs = tvm->iterations - 1;  /* Exclude first run */
-
-  if (num_runs <= 0) {
-    return;
-  }
-
-  gdouble sum = 0.0;
-  gdouble min_time = G_MAXDOUBLE;
-  gdouble max_time = 0.0;
-
-  for (gint i = 0; i < num_runs; i++) {
-    gdouble time_ms = tvm->perf_data.inference_times[i] / 1000.0;
-    sum += time_ms;
-    if (time_ms < min_time)
-      min_time = time_ms;
-    if (time_ms > max_time)
-      max_time = time_ms;
-  }
-
-  gdouble avg_time = sum / num_runs;
-  gdouble fps = 1000.0 / avg_time;
-
-  tvm->perf_data.avg_time = avg_time;
-  tvm->perf_data.min_time = min_time;
-  tvm->perf_data.max_time = max_time;
-  tvm->perf_data.fps = fps;
-
-  g_print ("\n");
-  g_print ("Performance Results:\n");
-  g_print ("  Average: %.2f ms\n", avg_time);
-  g_print ("  Min:     %.2f ms\n", min_time);
-  g_print ("  Max:     %.2f ms\n", max_time);
-  g_print ("  FPS:     %.1f\n", fps);
-  g_print ("\n");
-  g_print ("Inference completed successfully!\n");
-  g_print ("  Average inference time: %.2f ms\n", avg_time);
-  g_print ("  Using TVM+TIDL on TI C7x DSP\n");
-  g_print ("\n");
 }
 
 /* Helper functions */
