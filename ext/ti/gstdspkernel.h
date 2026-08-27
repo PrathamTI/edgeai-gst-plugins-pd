@@ -148,6 +148,9 @@ struct _GstDspKernel {
     gsize    expected_n_chunks;          /* Number of chunks expected from STFT */
     gsize    chunk_buffer_counter;       /* Sequential counter for each buffer in ISTFT */
 
+    /* Chunking control - auto-detected based on window_frames */
+    gboolean enable_chunking;            /* TRUE if window_frames > CHUNKING_THRESHOLD */
+
 };
 
 struct _GstDspKernelClass {

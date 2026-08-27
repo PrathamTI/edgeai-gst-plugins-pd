@@ -78,6 +78,9 @@ extern "C"
 GST_DEBUG_CATEGORY_STATIC (gst_dsp_kernel_debug_category);
 #define GST_CAT_DEFAULT gst_dsp_kernel_debug_category
 
+/* Auto-detection threshold: models with window_frames > this use overlap-save chunking */
+#define CHUNKING_THRESHOLD 256
+
 /* DSP message structure */
 struct c7x_msg_hdr
 {
@@ -386,6 +389,9 @@ gst_dsp_kernel_init (GstDspKernel * kernel)
   kernel->expected_n_chunks = 0;
   kernel->chunk_buffer_counter = 0;
 
+  /* Chunking will be auto-detected in start() based on window_frames */
+  kernel->enable_chunking = FALSE;
+
   memset (&kernel->dma_input, 0, sizeof (kernel->dma_input));
   memset (&kernel->dma_output, 0, sizeof (kernel->dma_output));
 
@@ -508,30 +514,51 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
   /* Ensure auto-detection has been done (should already be done in init) */
   gst_dsp_kernel_auto_detect_operation (kernel);
 
+  /* Auto-detect chunking requirement based on model window size */
+  if (kernel->window_frames > CHUNKING_THRESHOLD) {
+    kernel->enable_chunking = TRUE;
+    g_print ("[DSP] Large window_frames=%u (> %u threshold), "
+        "enabling overlap-save chunking for GCRN-like models\n",
+        kernel->window_frames, CHUNKING_THRESHOLD);
+  } else {
+    kernel->enable_chunking = FALSE;
+    g_print ("[DSP] Small window_frames=%u (<= %u threshold), "
+        "chunking disabled for simple models\n",
+        kernel->window_frames, CHUNKING_THRESHOLD);
+  }
+
   g_print ("TI DSP Kernel Element\n");
   g_print ("=====================\n");
   g_print ("[DSP] msg-type: 0x%04x ", kernel->msg_type);
   switch (kernel->msg_type) {
     case DSP_OP_STFT:
       g_print ("(STFT)\n");
-      g_print ("[DSP] STFT: initializing overlap-save chunking\n");
+      if (kernel->enable_chunking) {
+        g_print ("[DSP] STFT: initializing overlap-save chunking\n");
 
-      /* Initialize overlap-save parameters */
-      kernel->overlap_frames = 100;     /* Fixed overlap */
-      kernel->t_frames = kernel->overlap_frames / 2;    /* = 50 */
-      kernel->hop_frames = kernel->window_frames - kernel->overlap_frames;
-      kernel->hop_samples = kernel->hop_frames * kernel->hop_size;
-      kernel->chunk_samples = kernel->window_frames * kernel->hop_size;
+        /* Initialize overlap-save parameters */
+        kernel->overlap_frames = 100;
+        kernel->t_frames = kernel->overlap_frames / 2;
+        kernel->hop_frames = kernel->window_frames - kernel->overlap_frames;
+        kernel->hop_samples = kernel->hop_frames * kernel->hop_size;
+        kernel->chunk_samples = kernel->window_frames * kernel->hop_size;
 
-      g_print
-          ("[DSP] Overlap-save: OVERLAP=%zu T_FRAMES=%zu HOP_FRAMES=%zu HOP_SAMPLES=%zu\n",
-          kernel->overlap_frames, kernel->t_frames, kernel->hop_frames,
-          kernel->hop_samples);
+        g_print
+            ("[DSP] Overlap-save: OVERLAP=%zu T_FRAMES=%zu HOP_FRAMES=%zu HOP_SAMPLES=%zu\n",
+            kernel->overlap_frames, kernel->t_frames, kernel->hop_frames,
+            kernel->hop_samples);
+      } else {
+        g_print ("[DSP] STFT: simple pass-through mode (no chunking)\n");
+      }
       break;
     case DSP_OP_ISTFT:
       g_print ("(ISTFT)\n");
-      g_print
-          ("[DSP] ISTFT: initializing for chunk collection and reconstruction\n");
+      if (kernel->enable_chunking) {
+        g_print
+            ("[DSP] ISTFT: initializing for chunk collection and reconstruction\n");
+      } else {
+        g_print ("[DSP] ISTFT: simple pass-through mode (no chunking)\n");
+      }
       break;
     case DSP_OP_DEINT_INTERLEAVE:
       g_print ("(Deinterleave/Interleave, flag=%u)\n", kernel->param2);
@@ -714,28 +741,37 @@ dsp_kernel_transform_stft (GstDspKernel * kernel, GstBuffer * buf)
   GST_DEBUG_OBJECT (kernel, "STFT: Received %zu samples (%zu bytes)",
       incoming_samples, map_info.size);
 
-  /* Accumulate input buffer */
-  if (kernel->input_buffer_size + incoming_samples >
-      kernel->input_buffer_capacity) {
-    kernel->input_buffer_capacity =
-        kernel->input_buffer_size + incoming_samples + 65536;
-    kernel->input_buffer =
-        (gint16 *) g_realloc (kernel->input_buffer,
-        kernel->input_buffer_capacity * sizeof (gint16));
-    GST_DEBUG_OBJECT (kernel, "STFT: Resized input buffer to %zu samples",
-        kernel->input_buffer_capacity);
+  /* If chunking enabled, accumulate input buffer; otherwise pass through */
+  if (kernel->enable_chunking) {
+    /* Accumulate input buffer */
+    if (kernel->input_buffer_size + incoming_samples >
+        kernel->input_buffer_capacity) {
+      kernel->input_buffer_capacity =
+          kernel->input_buffer_size + incoming_samples + 65536;
+      kernel->input_buffer =
+          (gint16 *) g_realloc (kernel->input_buffer,
+          kernel->input_buffer_capacity * sizeof (gint16));
+      GST_DEBUG_OBJECT (kernel, "STFT: Resized input buffer to %zu samples",
+          kernel->input_buffer_capacity);
+    }
+
+    /* Append input to buffer */
+    memcpy (kernel->input_buffer + kernel->input_buffer_size, audio_in,
+        incoming_samples * sizeof (gint16));
+    kernel->input_buffer_size += incoming_samples;
+
+    GST_DEBUG_OBJECT (kernel, "STFT: Buffered %zu samples, total: %zu",
+        incoming_samples, kernel->input_buffer_size);
+
+    /* Return empty buffer - processing happens at EOS */
+    gst_buffer_set_size (buf, 0);
+  } else {
+    /* Simple mode: pass audio buffer through unchanged */
+    GST_DEBUG_OBJECT (kernel, "STFT: Pass-through (no chunking), %zu samples",
+        incoming_samples);
+    /* Keep buffer as-is, will be processed downstream */
   }
 
-  /* Append input to buffer */
-  memcpy (kernel->input_buffer + kernel->input_buffer_size, audio_in,
-      incoming_samples * sizeof (gint16));
-  kernel->input_buffer_size += incoming_samples;
-
-  GST_DEBUG_OBJECT (kernel, "STFT: Buffered %zu samples, total: %zu",
-      incoming_samples, kernel->input_buffer_size);
-
-  /* Return empty buffer - processing happens at EOS */
-  gst_buffer_set_size (buf, 0);
   gst_buffer_unmap (buf, &map_info);
   return GST_FLOW_OK;
 }
