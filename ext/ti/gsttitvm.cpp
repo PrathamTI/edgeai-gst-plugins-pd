@@ -357,11 +357,17 @@ gst_ti_tvm_finalize (GObject * object)
   g_free (tvm->auto_input_name);
 
   if (tvm->auto_input_shape) {
-    delete static_cast < std::vector < int64_t > *>(tvm->auto_input_shape);
+    delete
+        static_cast <
+        std::vector <
+    int64_t > *>(tvm->auto_input_shape);
     tvm->auto_input_shape = NULL;
   }
   if (tvm->auto_output_shape) {
-    delete static_cast < std::vector < int64_t > *>(tvm->auto_output_shape);
+    delete
+        static_cast <
+        std::vector <
+    int64_t > *>(tvm->auto_output_shape);
     tvm->auto_output_shape = NULL;
   }
 
@@ -514,6 +520,31 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   GST_DEBUG_OBJECT (tvm, "transform: %zu floats (%zu bytes)", input_size,
       in_map.size);
 
+  /* Debug: Log input data quality before inference */
+  g_print ("\n[TVM Input Data Quality Check]\n");
+  g_print ("  Total floats: %zu (expected for 4D shape)\n", input_size);
+  g_print ("  First 5 floats: ");
+  for (gsize i = 0; i < (input_size > 5 ? 5 : input_size); i++) {
+    g_print ("%.6f ", input_data[i]);
+  }
+  g_print ("\n");
+  if (input_size > 10) {
+    g_print ("  Last 5 floats: ");
+    for (gsize i = input_size - 5; i < input_size; i++) {
+      g_print ("%.6f ", input_data[i]);
+    }
+    g_print ("\n");
+  }
+  /* Check input for anomalies */
+  gfloat in_min = input_data[0], in_max = input_data[0];
+  for (gsize i = 0; i < input_size; i++) {
+    if (input_data[i] < in_min)
+      in_min = input_data[i];
+    if (input_data[i] > in_max)
+      in_max = input_data[i];
+  }
+  g_print ("  Input Min/Max: %.6f / %.6f\n", in_min, in_max);
+
   /* Run inference benchmark */
   ret = gst_ti_tvm_run_inference_benchmark (tvm, input_data, input_size);
 
@@ -531,6 +562,34 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
 
     /* Copy TVM output to buffer */
     out->CopyToBytes (out_map.data, out_bytes);
+
+    /* Debug: Log output data quality after inference */
+    gfloat *output_data = (gfloat *) out_map.data;
+    g_print ("[TVM Output Data Quality Check]\n");
+    g_print ("  Total floats: %zu\n", tvm->output_num_floats);
+    g_print ("  First 5 floats: ");
+    for (gsize i = 0;
+        i < (tvm->output_num_floats > 5 ? 5 : tvm->output_num_floats); i++) {
+      g_print ("%.6f ", output_data[i]);
+    }
+    g_print ("\n");
+    if (tvm->output_num_floats > 10) {
+      g_print ("  Last 5 floats: ");
+      for (gsize i = tvm->output_num_floats - 5; i < tvm->output_num_floats;
+          i++) {
+        g_print ("%.6f ", output_data[i]);
+      }
+      g_print ("\n");
+    }
+    /* Check output for anomalies */
+    gfloat out_min = output_data[0], out_max = output_data[0];
+    for (gsize i = 0; i < tvm->output_num_floats; i++) {
+      if (output_data[i] < out_min)
+        out_min = output_data[i];
+      if (output_data[i] > out_max)
+        out_max = output_data[i];
+    }
+    g_print ("  Output Min/Max: %.6f / %.6f\n", out_min, out_max);
 
     gst_buffer_unmap (outbuf, &out_map);
 
@@ -589,9 +648,26 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
         tvm->auto_input_name = json_input_name;
       }
       GST_INFO_OBJECT (tvm, "[TVM] Shape auto-detection: SUCCESS");
+      /* Log detected shapes for verification */
+      g_print ("[TVM Model Shape Detection (from deploy_graph.json)]\n");
+      g_print ("  Input shape: [");
+      for (size_t i = 0; i < json_input_shape.size (); i++) {
+        g_print ("%s%ld", (i > 0) ? "," : "", json_input_shape[i]);
+      }
+      g_print ("]\n");
+      g_print ("  Output shape: [");
+      for (size_t i = 0; i < json_output_shape.size (); i++) {
+        g_print ("%s%ld", (i > 0) ? "," : "", json_output_shape[i]);
+      }
+      g_print ("]\n");
+      g_print ("  Input name: %s\n",
+          json_input_name ? json_input_name : "unknown");
     } else {
       GST_WARNING_OBJECT (tvm,
           "[TVM] Shape auto-detection: FAILED (will require input-shape property)");
+      g_print ("[TVM Model Shape Detection]\n");
+      g_print
+          ("  Shape auto-detection FAILED - will use property or 1D shape\n");
     }
 
     auto graph_executor_create = Registry::Get ("tvm.graph_executor.create");
@@ -704,8 +780,22 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
         GST_INFO_OBJECT (tvm,
             "[TVM] Using auto-detected shape: [%ld,%ld,%ld,%ld]", shape[0],
             shape[1], shape[2], shape[3]);
+        g_print ("[TVM Model Configuration]\n");
+        g_print ("  Auto-detected shape: [%ld,%ld,%ld,%ld]\n", shape[0],
+            shape[1], shape[2], shape[3]);
+        g_print ("  Shape dims: batch=%ld, channels=%ld, freq=%ld, time=%ld\n",
+            shape[0], shape[1], shape[2], shape[3]);
+        /* Calculate derived parameters from shape */
+        gint64 fft_derived = (shape[2] - 1) * 2;
+        g_print ("  Derived FFT size from freq bins: %ld\n", fft_derived);
       } else {
         GST_INFO_OBJECT (tvm, "[TVM] Using auto-detected shape");
+        g_print ("[TVM Model Configuration]\n");
+        g_print ("  Auto-detected shape: ");
+        for (size_t i = 0; i < shape.size (); i++) {
+          g_print ("%s%ld", (i > 0) ? "," : "", shape[i]);
+        }
+        g_print ("\n");
       }
     }
     /* Option 2: Parse input shape from property if provided */
@@ -762,6 +852,17 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
         }
     );
     input_array.CopyFromBytes (input_data, input_size * sizeof (float));
+
+    /* Validate input data transfer */
+    g_print ("[TVM Input Array Validation]\n");
+    g_print ("  Input shape: ");
+    for (int i = 0; i < input_array->ndim; i++) {
+      g_print ("%s%ld", (i > 0) ? "," : "", input_array->shape[i]);
+    }
+    g_print ("\n");
+    g_print ("  Expected elements: %zu, Actual: %lu\n", input_size,
+        input_array->shape[0] * input_array->shape[1] * input_array->shape[2] *
+        input_array->shape[3]);
 
     if (tvm->benchmark) {
       g_print ("\n[TVM] Running inference...\n");

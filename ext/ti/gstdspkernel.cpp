@@ -90,14 +90,17 @@ struct c7x_msg_hdr
   int32_t status;
 } __attribute__((packed));
 
-/* STFT/ISTFT message structure (matches DSP firmware stft_istft_msg) */
+/* STFT/ISTFT message structure - MUST match C app format with 5 params!
+ * C app uses: param0=selected_model, param1=input_buf, param2=output_buf, param3=input_frame, param4=output_frame
+ * NOT the direct struct approach! */
 struct stft_istft_msg
 {
   struct c7x_msg_hdr hdr;
-  uint32_t input_buffer;        /* Physical address of input DMA buffer */
-  uint32_t output_buffer;       /* Physical address of output DMA buffer */
-  uint32_t input_frame;         /* Number of frames to process */
-  uint32_t output_frame;        /* Must equal input_frame */
+  uint32_t selected_model;      /* param0: model ID (0 for GCRN) */
+  uint32_t input_buffer;        /* param1: Physical address of input DMA buffer */
+  uint32_t output_buffer;       /* param2: Physical address of output DMA buffer */
+  uint32_t input_frame;         /* param3: Number of frames to process */
+  uint32_t output_frame;        /* param4: Must equal input_frame */
 } __attribute__((packed));
 
 /* Deinterleave/Interleave message structure (matches DSP firmware) */
@@ -114,8 +117,8 @@ struct deint_interleave_msg
 /* Compile-time assertions to ensure message sizes match DSP firmware */
 static_assert (sizeof (struct c7x_msg_hdr) == 16,
     "c7x_msg_hdr must be 16 bytes");
-static_assert (sizeof (struct stft_istft_msg) == 32,
-    "stft_istft_msg must be 32 bytes (16 header + 4 fields)");
+static_assert (sizeof (struct stft_istft_msg) == 36,
+    "stft_istft_msg must be 36 bytes (16 header + 5 params to match C app format)");
 static_assert (sizeof (struct deint_interleave_msg) == 36,
     "deint_interleave_msg must be 36 bytes (16 header + 5 fields)");
 
@@ -593,11 +596,31 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
   }
 
   kernel->dma_allocated = TRUE;
-  g_print ("[DSP] DMA buffers allocated\n");
+
+  /* Print comprehensive DMA buffer summary similar to C application */
+  g_print ("\n");
+  g_print ("========== [DSP Kernel] Initialization Summary ==========\n");
+  g_print ("[DSP] Configuration:\n");
+  g_print ("[DSP]   msg-type: 0x%04x (%s)\n", kernel->msg_type,
+      kernel->msg_type == 0x1020 ? "STFT" :
+      kernel->msg_type == 0x1030 ? "ISTFT" :
+      kernel->msg_type == 0x1040 ? "Deinterleave/Interleave" : "Unknown");
+  g_print ("[DSP]   hop-size: %u samples\n", kernel->hop_size);
+  g_print ("[DSP]   fft-size: %u\n", kernel->fft_size);
+  g_print ("[DSP]   window-frames: %u\n", kernel->window_frames);
+  g_print ("[DSP]   batch-size: %u\n", kernel->batch_size);
+  g_print ("[DSP] DMA buffers allocated:\n");
   g_print ("[DSP]   input:  %u bytes @ phys=0x%08lx\n",
       kernel->input_buf_size, (unsigned long) kernel->dma_input.phys_addr);
   g_print ("[DSP]   output: %u bytes @ phys=0x%08lx\n",
       kernel->output_buf_size, (unsigned long) kernel->dma_output.phys_addr);
+  if (kernel->enable_chunking) {
+    g_print ("[DSP] Overlap-save chunking enabled:\n");
+    g_print ("[DSP]   overlap_frames: %zu\n", kernel->overlap_frames);
+    g_print ("[DSP]   hop_frames: %zu\n", kernel->hop_frames);
+    g_print ("[DSP]   chunk_samples: %zu\n", kernel->chunk_samples);
+  }
+  g_print ("=========================================================\n\n");
 
   return TRUE;
 }
@@ -643,6 +666,29 @@ dsp_kernel_send_recv_stft (GstDspKernel * kernel, struct stft_istft_msg *req,
   GST_DEBUG_OBJECT (kernel, "  input_frame=%u output_frame=%u",
       req->input_frame, req->output_frame);
 
+  /* COMPREHENSIVE DEBUG: Log all message fields before sending */
+  g_print
+      ("\n========== [STFT DEBUG] FULL MESSAGE DUMP BEFORE SEND ==========\n");
+  g_print ("Message struct size: %zu bytes (expected 36)\n", sizeof (*req));
+  g_print ("Header:\n");
+  g_print ("  type=0x%04x seq=%u len=%u status=%d\n",
+      req->hdr.type, req->hdr.seq, req->hdr.len, req->hdr.status);
+  g_print ("Parameters:\n");
+  g_print ("  selected_model=%u (param0)\n", req->selected_model);
+  g_print ("  input_buffer=0x%08x (param1)\n", req->input_buffer);
+  g_print ("  output_buffer=0x%08x (param2)\n", req->output_buffer);
+  g_print ("  input_frame=%u (param3)\n", req->input_frame);
+  g_print ("  output_frame=%u (param4)\n", req->output_frame);
+  g_print ("Raw bytes (hex): ");
+  unsigned char *raw = (unsigned char *) req;
+  for (size_t i = 0; i < sizeof (*req); i++) {
+    g_print ("%02x ", raw[i]);
+    if ((i + 1) % 16 == 0)
+      g_print ("\n                 ");
+  }
+  g_print
+      ("\n============================================================\n\n");
+
   gst_ti_rpmsg_chan_lock (kernel->rpmsg_chan);
 
   if (send_msg (kernel->rpmsg_chan->fd, (char *) req, sizeof (*req)) < 0) {
@@ -666,6 +712,30 @@ dsp_kernel_send_recv_stft (GstDspKernel * kernel, struct stft_istft_msg *req,
       resp->hdr.status);
   GST_DEBUG_OBJECT (kernel, "  input_frame=%u output_frame=%u",
       resp->input_frame, resp->output_frame);
+
+  /* COMPREHENSIVE DEBUG: Log all response message fields */
+  g_print
+      ("\n========== [STFT DEBUG] FULL RESPONSE DUMP FROM DSP ==========\n");
+  g_print ("Response struct size: %zu bytes (expected 36)\n", sizeof (*resp));
+  g_print ("Response length from DSP: %d bytes\n", resp_len);
+  g_print ("Header:\n");
+  g_print ("  type=0x%04x seq=%u len=%u status=%d\n",
+      resp->hdr.type, resp->hdr.seq, resp->hdr.len, resp->hdr.status);
+  g_print ("Parameters:\n");
+  g_print ("  selected_model=%u (param0)\n", resp->selected_model);
+  g_print ("  input_buffer=0x%08x (param1)\n", resp->input_buffer);
+  g_print ("  output_buffer=0x%08x (param2)\n", resp->output_buffer);
+  g_print ("  input_frame=%u (param3)\n", resp->input_frame);
+  g_print ("  output_frame=%u (param4)\n", resp->output_frame);
+  g_print ("Raw bytes (hex): ");
+  unsigned char *resp_raw = (unsigned char *) resp;
+  for (int i = 0; i < resp_len; i++) {
+    g_print ("%02x ", resp_raw[i]);
+    if ((i + 1) % 16 == 0)
+      g_print ("\n                ");
+  }
+  g_print
+      ("\n============================================================\n\n");
 
   if (resp->hdr.type != expected_resp || resp->hdr.status != C7X_STATUS_SUCCESS) {
     GST_ERROR_OBJECT (kernel, "DSP error: type=0x%x (expected 0x%x) status=%d",
@@ -847,6 +917,7 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
     req.hdr.type = kernel->msg_type;
     req.hdr.seq = kernel->sequence_number++;
     req.hdr.len = sizeof (req);
+    req.selected_model = 2;     /* param0: MODEL_GCRN=2 (Graph-based Complex Recurrent Network) */
     req.input_buffer = (uint32_t) kernel->dma_input.phys_addr;
     req.output_buffer = (uint32_t) kernel->dma_output.phys_addr;
     req.input_frame = frames_in_batch;  /* Number of frames in this batch */
@@ -1061,6 +1132,16 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
       g_print ("  Duration: %u:%02u.%03u (%u ms, %.6f sec @ 16kHz)\n",
           audio_minutes, audio_seconds, audio_milliseconds, audio_duration_ms,
           audio_duration_sec);
+      g_print ("\n");
+      g_print
+          ("========== [Pipeline] All chunks processing complete ==========\n");
+      g_print ("[Pipeline] Successfully processed %zu chunks\n",
+          kernel->chunks_received);
+      g_print ("[Pipeline] Final output: %zu samples (%.1f seconds)\n",
+          final_samples, audio_duration_sec);
+      g_print ("[Pipeline] Status: SUCCESS\n");
+      g_print
+          ("============================================================\n\n");
 
       gst_buffer_unmap (buf, &map_info);
 
@@ -1198,8 +1279,8 @@ dsp_kernel_transform_deint_interleave (GstDspKernel * kernel, GstBuffer * buf)
 
   g_print ("[%s] Sending RPMsg to DSP:\n", op_name);
   g_print ("  Message type:    0x%04x (response: 0x%04x)\n", req.hdr.type,
-      kernel->msg_resp_type ? kernel->msg_resp_type : ((kernel->
-              msg_type & 0x0FFF) | 0x2000));
+      kernel->msg_resp_type ? kernel->
+      msg_resp_type : ((kernel->msg_type & 0x0FFF) | 0x2000));
   g_print ("  Input buffer:    0x%08x (phys)\n", req.input_buffer);
   g_print ("  Output buffer:   0x%08x (phys)\n", req.output_buffer);
   g_print ("  Input frames:    %u\n", req.input_frame);
@@ -1362,6 +1443,7 @@ dsp_kernel_process_chunks (GstDspKernel * kernel, GstBaseTransform * trans)
       req.hdr.type = kernel->msg_type;
       req.hdr.seq = kernel->sequence_number++;
       req.hdr.len = sizeof (req);
+      req.selected_model = 2;   /* param0: MODEL_GCRN=2 (Graph-based Complex Recurrent Network) */
       req.input_buffer = (uint32_t) kernel->dma_input.phys_addr;
       req.output_buffer = (uint32_t) kernel->dma_output.phys_addr;
       req.input_frame = frames_in_batch;
