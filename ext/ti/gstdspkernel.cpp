@@ -68,6 +68,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <cstdio>
 
 extern "C"
 {
@@ -659,35 +660,6 @@ dsp_kernel_send_recv_stft (GstDspKernel * kernel, struct stft_istft_msg *req,
   uint32_t expected_resp = kernel->msg_resp_type ?
       kernel->msg_resp_type : ((kernel->msg_type & 0x0FFF) | 0x2000);
 
-  GST_DEBUG_OBJECT (kernel, "Sending STFT/ISTFT msg: type=0x%04x seq=%u len=%u",
-      req->hdr.type, req->hdr.seq, req->hdr.len);
-  GST_DEBUG_OBJECT (kernel, "  in_buf=0x%08x out_buf=0x%08x",
-      req->input_buffer, req->output_buffer);
-  GST_DEBUG_OBJECT (kernel, "  input_frame=%u output_frame=%u",
-      req->input_frame, req->output_frame);
-
-  /* COMPREHENSIVE DEBUG: Log all message fields before sending */
-  g_print
-      ("\n========== [STFT DEBUG] FULL MESSAGE DUMP BEFORE SEND ==========\n");
-  g_print ("Message struct size: %zu bytes (expected 36)\n", sizeof (*req));
-  g_print ("Header:\n");
-  g_print ("  type=0x%04x seq=%u len=%u status=%d\n",
-      req->hdr.type, req->hdr.seq, req->hdr.len, req->hdr.status);
-  g_print ("Parameters:\n");
-  g_print ("  selected_model=%u (param0)\n", req->selected_model);
-  g_print ("  input_buffer=0x%08x (param1)\n", req->input_buffer);
-  g_print ("  output_buffer=0x%08x (param2)\n", req->output_buffer);
-  g_print ("  input_frame=%u (param3)\n", req->input_frame);
-  g_print ("  output_frame=%u (param4)\n", req->output_frame);
-  g_print ("Raw bytes (hex): ");
-  unsigned char *raw = (unsigned char *) req;
-  for (size_t i = 0; i < sizeof (*req); i++) {
-    g_print ("%02x ", raw[i]);
-    if ((i + 1) % 16 == 0)
-      g_print ("\n                 ");
-  }
-  g_print
-      ("\n============================================================\n\n");
 
   gst_ti_rpmsg_chan_lock (kernel->rpmsg_chan);
 
@@ -707,35 +679,6 @@ dsp_kernel_send_recv_stft (GstDspKernel * kernel, struct stft_istft_msg *req,
 
   gst_ti_rpmsg_chan_unlock (kernel->rpmsg_chan);
 
-  GST_DEBUG_OBJECT (kernel,
-      "Received STFT/ISTFT response: type=0x%04x status=%d", resp->hdr.type,
-      resp->hdr.status);
-  GST_DEBUG_OBJECT (kernel, "  input_frame=%u output_frame=%u",
-      resp->input_frame, resp->output_frame);
-
-  /* COMPREHENSIVE DEBUG: Log all response message fields */
-  g_print
-      ("\n========== [STFT DEBUG] FULL RESPONSE DUMP FROM DSP ==========\n");
-  g_print ("Response struct size: %zu bytes (expected 36)\n", sizeof (*resp));
-  g_print ("Response length from DSP: %d bytes\n", resp_len);
-  g_print ("Header:\n");
-  g_print ("  type=0x%04x seq=%u len=%u status=%d\n",
-      resp->hdr.type, resp->hdr.seq, resp->hdr.len, resp->hdr.status);
-  g_print ("Parameters:\n");
-  g_print ("  selected_model=%u (param0)\n", resp->selected_model);
-  g_print ("  input_buffer=0x%08x (param1)\n", resp->input_buffer);
-  g_print ("  output_buffer=0x%08x (param2)\n", resp->output_buffer);
-  g_print ("  input_frame=%u (param3)\n", resp->input_frame);
-  g_print ("  output_frame=%u (param4)\n", resp->output_frame);
-  g_print ("Raw bytes (hex): ");
-  unsigned char *resp_raw = (unsigned char *) resp;
-  for (int i = 0; i < resp_len; i++) {
-    g_print ("%02x ", resp_raw[i]);
-    if ((i + 1) % 16 == 0)
-      g_print ("\n                ");
-  }
-  g_print
-      ("\n============================================================\n\n");
 
   if (resp->hdr.type != expected_resp || resp->hdr.status != C7X_STATUS_SUCCESS) {
     GST_ERROR_OBJECT (kernel, "DSP error: type=0x%x (expected 0x%x) status=%d",
@@ -808,8 +751,6 @@ dsp_kernel_transform_stft (GstDspKernel * kernel, GstBuffer * buf)
   const gint16 *audio_in = (const gint16 *) map_info.data;
   gsize incoming_samples = map_info.size / sizeof (gint16);
 
-  GST_DEBUG_OBJECT (kernel, "STFT: Received %zu samples (%zu bytes)",
-      incoming_samples, map_info.size);
 
   /* If chunking enabled, accumulate input buffer; otherwise pass through */
   if (kernel->enable_chunking) {
@@ -830,8 +771,6 @@ dsp_kernel_transform_stft (GstDspKernel * kernel, GstBuffer * buf)
         incoming_samples * sizeof (gint16));
     kernel->input_buffer_size += incoming_samples;
 
-    GST_DEBUG_OBJECT (kernel, "STFT: Buffered %zu samples, total: %zu",
-        incoming_samples, kernel->input_buffer_size);
 
     /* Return empty buffer - processing happens at EOS */
     gst_buffer_set_size (buf, 0);
@@ -861,13 +800,11 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
 
   /* Handle empty input (STFT still accumulating) - pass through empty buffer */
   if (total_spectral_bytes == 0) {
-    GST_DEBUG_OBJECT (kernel, "ISTFT: Empty input, passing through");
     gst_buffer_set_size (buf, 0);
     gst_buffer_unmap (buf, &map_info);
     return GST_FLOW_OK;
   }
 
-  g_print ("[ISTFT] Processing %zu spectral bytes...\n", total_spectral_bytes);
   GST_INFO_OBJECT (kernel, "ISTFT: Processing %zu spectral bytes",
       total_spectral_bytes);
 
@@ -933,8 +870,6 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
      * Output per frame = hop_size samples */
     gsize batch_audio_samples = resp.output_frame * kernel->hop_size;
     gsize batch_audio_bytes = batch_audio_samples * sizeof (gint16);
-    GST_DEBUG_OBJECT (kernel, "ISTFT: Batch %u output: %zu bytes = %zu samples",
-        batch_idx + 1, batch_audio_bytes, batch_audio_samples);
     dmabuf_sync (kernel->dma_output.dma_buf_fd, DMA_BUF_SYNC_START);
     memcpy (audio_out + out_written_samples, kernel->dma_output.kern_addr,
         batch_audio_bytes);
@@ -944,8 +879,6 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
     spectral_offset += batch_spectral_bytes;
   }
 
-  g_print ("[ISTFT] Done: %zu spectral bytes → %zu audio samples\n",
-      total_spectral_bytes, out_written_samples);
   GST_INFO_OBJECT (kernel,
       "ISTFT: Complete - input=%zu bytes output=%zu samples (%zu bytes)",
       total_spectral_bytes, out_written_samples,
@@ -1126,22 +1059,6 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
           "  Duration: %u:%02u.%03u (%.6f seconds)",
           audio_minutes, audio_seconds, audio_milliseconds, audio_duration_sec);
 
-      g_print ("[ISTFT] FINAL AUDIO OUTPUT LENGTH (after padding trim):\n");
-      g_print ("  Samples: %zu\n", final_samples);
-      g_print ("  Bytes: %zu\n", output_bytes);
-      g_print ("  Duration: %u:%02u.%03u (%u ms, %.6f sec @ 16kHz)\n",
-          audio_minutes, audio_seconds, audio_milliseconds, audio_duration_ms,
-          audio_duration_sec);
-      g_print ("\n");
-      g_print
-          ("========== [Pipeline] All chunks processing complete ==========\n");
-      g_print ("[Pipeline] Successfully processed %zu chunks\n",
-          kernel->chunks_received);
-      g_print ("[Pipeline] Final output: %zu samples (%.1f seconds)\n",
-          final_samples, audio_duration_sec);
-      g_print ("[Pipeline] Status: SUCCESS\n");
-      g_print
-          ("============================================================\n\n");
 
       gst_buffer_unmap (buf, &map_info);
 
@@ -1196,12 +1113,6 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
       "  Duration: %u:%02u.%03u (%.6f seconds)",
       audio_minutes, audio_seconds, audio_milliseconds, audio_duration_sec);
 
-  g_print ("[ISTFT] SINGLE BUFFER OUTPUT LENGTH:\n");
-  g_print ("  Samples: %zu\n", final_output_samples);
-  g_print ("  Bytes: %zu\n", output_bytes);
-  g_print ("  Duration: %u:%02u.%03u (%u ms, %.6f sec @ 16kHz)\n",
-      audio_minutes, audio_seconds, audio_milliseconds, audio_duration_ms,
-      audio_duration_sec);
 
   gst_buffer_unmap (buf, &map_info);
 
@@ -1234,7 +1145,6 @@ dsp_kernel_transform_deint_interleave (GstDspKernel * kernel, GstBuffer * buf)
 
   /* Handle empty input - pass through empty buffer */
   if (input_size == 0) {
-    GST_DEBUG_OBJECT (kernel, "%s: Empty input, passing through", op_name);
     gst_buffer_unmap (buf, &map_info);
     return GST_FLOW_OK;
   }
@@ -1277,18 +1187,6 @@ dsp_kernel_transform_deint_interleave (GstDspKernel * kernel, GstBuffer * buf)
   req.fft_size = kernel->fft_size;      /* FFT size (320 for GCRN) */
   req.flag = kernel->param2;    /* 0=deinterleave, 1=interleave */
 
-  g_print ("[%s] Sending RPMsg to DSP:\n", op_name);
-  g_print ("  Message type:    0x%04x (response: 0x%04x)\n", req.hdr.type,
-      kernel->msg_resp_type ? kernel->
-      msg_resp_type : ((kernel->msg_type & 0x0FFF) | 0x2000));
-  g_print ("  Input buffer:    0x%08x (phys)\n", req.input_buffer);
-  g_print ("  Output buffer:   0x%08x (phys)\n", req.output_buffer);
-  g_print ("  Input frames:    %u\n", req.input_frame);
-  g_print ("  FFT size:        %u\n", req.fft_size);
-  g_print ("  Flag:            %u (%s)\n", req.flag,
-      req.flag == 0 ? "deinterleave" : "interleave");
-  g_print ("  Data size:       %zu bytes (%zu floats)\n", input_size,
-      input_size / sizeof (float));
 
   if (dsp_kernel_send_recv_deint (kernel, &req, &resp) != GST_FLOW_OK) {
     gst_buffer_unmap (buf, &map_info);
@@ -1316,8 +1214,6 @@ dsp_kernel_transform_deint_interleave (GstDspKernel * kernel, GstBuffer * buf)
   gst_buffer_set_size (buf, (gssize) output_size);
   gst_buffer_unmap (buf, &map_info);
 
-  g_print ("[%s] Done: %zu bytes → %zu bytes\n", op_name, input_size,
-      output_size);
   GST_INFO_OBJECT (kernel, "%s: Complete - input=%zu output=%zu", op_name,
       input_size, output_size);
   return GST_FLOW_OK;
@@ -1427,10 +1323,6 @@ dsp_kernel_process_chunks (GstDspKernel * kernel, GstBaseTransform * trans)
       gsize batch_bytes = batch_samples * sizeof (gint16);
       gsize sample_offset = frame_start * kernel->hop_size;
 
-      GST_DEBUG_OBJECT (kernel,
-          "STFT: Chunk %zu Batch %u/%u - frames=%u samples=%zu",
-          chunk_idx + 1, batch_idx + 1, num_batches, frames_in_batch,
-          batch_samples);
 
       /* Copy batch to DMA input */
       dmabuf_sync (kernel->dma_input.dma_buf_fd, DMA_BUF_SYNC_START);
@@ -1463,8 +1355,6 @@ dsp_kernel_process_chunks (GstDspKernel * kernel, GstBaseTransform * trans)
       gsize batch_spectral_bytes =
           resp.output_frame * out_bins_per_frame * sizeof (float);
 
-      GST_DEBUG_OBJECT (kernel, "STFT: Chunk %zu Batch %u output: %zu bytes",
-          chunk_idx + 1, batch_idx + 1, batch_spectral_bytes);
       dmabuf_sync (kernel->dma_output.dma_buf_fd, DMA_BUF_SYNC_START);
       memcpy (chunk_spectral + chunk_offset_bytes, kernel->dma_output.kern_addr,
           batch_spectral_bytes);
