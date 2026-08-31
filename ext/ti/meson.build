@@ -31,7 +31,7 @@ endif
 
 if get_option('stft-plugins').enabled()
   gst_ti_plugin_sources += [
-    'gsttirpmsgctx.cpp',
+    '../../utility/gsttirpmsgctx.cpp',
     'gstdspkernel.cpp',
   ]
 endif
@@ -63,7 +63,7 @@ endif
 
 if get_option('stft-plugins').enabled()
   gst_ti_plugin_headers += [
-    'gsttirpmsgctx.h',
+    '../../utility/gsttirpmsgctx.h',
     'gstdspkernel.h',
   ]
 endif
