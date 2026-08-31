@@ -149,13 +149,13 @@ enum
 #define DEFAULT_REMOTE_EP       13
 #define DEFAULT_MSG_TYPE        0
 #define DEFAULT_MSG_RESP_TYPE   0
-#define DEFAULT_INPUT_BUF_SIZE  (64 * 1024)
-#define DEFAULT_OUTPUT_BUF_SIZE (256 * 1024)
+#define DEFAULT_INPUT_BUF_SIZE  0
+#define DEFAULT_OUTPUT_BUF_SIZE 0
 #define DEFAULT_PARAM2          0
-#define DEFAULT_HOP_SIZE        160
-#define DEFAULT_FFT_SIZE        320
-#define DEFAULT_WINDOW_FRAMES   401
-#define DEFAULT_BATCH_SIZE      64
+#define DEFAULT_HOP_SIZE        0
+#define DEFAULT_FFT_SIZE        0
+#define DEFAULT_WINDOW_FRAMES   0
+#define DEFAULT_BATCH_SIZE      0
 
 /* Function prototypes */
 static void gst_dsp_kernel_auto_detect_operation (GstDspKernel * kernel);
@@ -253,13 +253,13 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_INPUT_BUF_SIZE,
       g_param_spec_uint ("input-buf-size", "Input Buffer Size",
-          "DMA input buffer size in bytes",
-          1, G_MAXUINT, DEFAULT_INPUT_BUF_SIZE,
+          "DMA input buffer size in bytes (0 = auto-calculate based on window-frames, fft-size, hop-size)",
+          0, G_MAXUINT, DEFAULT_INPUT_BUF_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_OUTPUT_BUF_SIZE,
       g_param_spec_uint ("output-buf-size", "Output Buffer Size",
-          "DMA output buffer size in bytes",
+          "DMA output buffer size in bytes (0 = auto-calculate based on window-frames, fft-size, hop-size)",
           0, G_MAXUINT, DEFAULT_OUTPUT_BUF_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
@@ -272,26 +272,102 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
   g_object_class_install_property (gobject_class, PROP_HOP_SIZE,
       g_param_spec_uint ("hop-size", "Hop Size",
           "Hop size between frames (for STFT/ISTFT)",
-          1, 8192, DEFAULT_HOP_SIZE,
+          0, 8192, DEFAULT_HOP_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_FFT_SIZE,
       g_param_spec_uint ("fft-size", "FFT Size",
           "FFT size in samples (for STFT/ISTFT)",
-          1, 8192, DEFAULT_FFT_SIZE,
+          0, 8192, DEFAULT_FFT_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_WINDOW_FRAMES,
       g_param_spec_uint ("window-frames", "Window Frames",
           "Total frames to accumulate (for STFT/ISTFT)",
-          1, 8192, DEFAULT_WINDOW_FRAMES,
+          0, 8192, DEFAULT_WINDOW_FRAMES,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_BATCH_SIZE,
       g_param_spec_uint ("batch-size", "Batch Size",
           "Frames per batch (for STFT/ISTFT)",
-          1, 8192, DEFAULT_BATCH_SIZE,
+          0, 8192, DEFAULT_BATCH_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+}
+
+/* Calculate DMA buffer sizes based on operation type and parameters */
+static void
+gst_dsp_kernel_calculate_buffer_sizes (GstDspKernel * kernel)
+{
+  /* If user provided explicit buffer sizes, use them */
+  if (kernel->input_buf_size > 0 && kernel->output_buf_size > 0) {
+    return;
+  }
+
+  /* model_elems = (fft_size/2 + 1) * 2 for complex spectral data */
+  guint model_elems = (kernel->fft_size / 2 + 1) * 2;
+
+  g_print
+      ("[DSP] Auto-calculating buffer sizes: model_elems=%u (from fft_size=%u)\n",
+      model_elems, kernel->fft_size);
+
+  switch (kernel->msg_type) {
+    case DSP_OP_STFT:
+      /* STFT: input is audio (int16), output is spectral (float)
+       * Input buffer:  window_frames * hop_size * sizeof(int16_t)
+       * Output buffer: window_frames * model_elems * sizeof(float) */
+      kernel->input_buf_size =
+          kernel->window_frames * kernel->hop_size * sizeof (int16_t);
+      kernel->output_buf_size =
+          kernel->window_frames * model_elems * sizeof (float);
+      g_print ("[DSP] Auto-calculated STFT buffer sizes:\n");
+      g_print
+          ("[DSP]   input:  %u bytes (window_frames=%u * hop_size=%u * 2)\n",
+          kernel->input_buf_size, kernel->window_frames, kernel->hop_size);
+      g_print
+          ("[DSP]   output: %u bytes (window_frames=%u * model_elems=%u * 4)\n",
+          kernel->output_buf_size, kernel->window_frames, model_elems);
+      break;
+
+    case DSP_OP_ISTFT:
+      /* ISTFT: input is spectral (float), output is audio (int16)
+       * Input buffer:  window_frames * model_elems * sizeof(float)
+       * Output buffer: window_frames * hop_size * sizeof(int16_t) */
+      kernel->input_buf_size =
+          kernel->window_frames * model_elems * sizeof (float);
+      kernel->output_buf_size =
+          kernel->window_frames * kernel->hop_size * sizeof (int16_t);
+      g_print ("[DSP] Auto-calculated ISTFT buffer sizes:\n");
+      g_print
+          ("[DSP]   input:  %u bytes (window_frames=%u * model_elems=%u * 4)\n",
+          kernel->input_buf_size, kernel->window_frames, model_elems);
+      g_print
+          ("[DSP]   output: %u bytes (window_frames=%u * hop_size=%u * 2)\n",
+          kernel->output_buf_size, kernel->window_frames, kernel->hop_size);
+      break;
+
+    case DSP_OP_DEINT_INTERLEAVE:
+      /* Deinterleave/Interleave: both input and output are spectral (float)
+       * Buffer size: window_frames * model_elems * sizeof(float)
+       * Layout differs: interleaved vs separate real/imaginary planes */
+      kernel->input_buf_size =
+          kernel->window_frames * model_elems * sizeof (float);
+      kernel->output_buf_size =
+          kernel->window_frames * model_elems * sizeof (float);
+      g_print ("[DSP] Auto-calculated Deinterleave/Interleave buffer sizes:\n");
+      g_print
+          ("[DSP]   input:  %u bytes (window_frames=%u * model_elems=%u * 4)\n",
+          kernel->input_buf_size, kernel->window_frames, model_elems);
+      g_print
+          ("[DSP]   output: %u bytes (window_frames=%u * model_elems=%u * 4)\n",
+          kernel->output_buf_size, kernel->window_frames, model_elems);
+      break;
+
+    default:
+      g_print
+          ("[DSP] Unknown operation type 0x%04x, buffer sizes must be provided\n",
+          kernel->msg_type);
+      break;
+  }
 }
 
 /* Auto-detect operation type from element name */
@@ -518,6 +594,9 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
   /* Ensure auto-detection has been done (should already be done in init) */
   gst_dsp_kernel_auto_detect_operation (kernel);
 
+  /* Auto-calculate buffer sizes if not explicitly provided */
+  gst_dsp_kernel_calculate_buffer_sizes (kernel);
+
   /* Auto-detect chunking requirement based on model window size */
   if (kernel->window_frames > CHUNKING_THRESHOLD) {
     kernel->enable_chunking = TRUE;
@@ -615,7 +694,7 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
       kernel->input_buf_size, (unsigned long) kernel->dma_input.phys_addr);
   g_print ("[DSP]   output: %u bytes @ phys=0x%08lx\n",
       kernel->output_buf_size, (unsigned long) kernel->dma_output.phys_addr);
-  if (kernel->enable_chunking) {
+  if (kernel->enable_chunking && kernel->msg_type == 0x1020) {
     g_print ("[DSP] Overlap-save chunking enabled:\n");
     g_print ("[DSP]   overlap_frames: %zu\n", kernel->overlap_frames);
     g_print ("[DSP]   hop_frames: %zu\n", kernel->hop_frames);
