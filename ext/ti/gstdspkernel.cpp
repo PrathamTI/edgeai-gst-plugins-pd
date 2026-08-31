@@ -143,7 +143,7 @@ enum
   PROP_BATCH_SIZE,
 };
 
-/* Defaults */
+/* Defaults for infrastructure parameters */
 #define DEFAULT_RPROC_DEVICE    "/dev/remoteproc0"
 #define DEFAULT_RPROC_ID        8
 #define DEFAULT_REMOTE_EP       13
@@ -152,6 +152,7 @@ enum
 #define DEFAULT_INPUT_BUF_SIZE  0
 #define DEFAULT_OUTPUT_BUF_SIZE 0
 #define DEFAULT_PARAM2          0
+
 #define DEFAULT_HOP_SIZE        0
 #define DEFAULT_FFT_SIZE        0
 #define DEFAULT_WINDOW_FRAMES   0
@@ -271,35 +272,44 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_HOP_SIZE,
       g_param_spec_uint ("hop-size", "Hop Size",
-          "Hop size between frames (for STFT/ISTFT)",
+          "Hop size between frames (for STFT/ISTFT) - REQUIRED, must be > 0",
           0, 8192, DEFAULT_HOP_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_FFT_SIZE,
       g_param_spec_uint ("fft-size", "FFT Size",
-          "FFT size in samples (for STFT/ISTFT)",
+          "FFT size in samples (for STFT/ISTFT) - REQUIRED, must be > 0",
           0, 8192, DEFAULT_FFT_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_WINDOW_FRAMES,
       g_param_spec_uint ("window-frames", "Window Frames",
-          "Total frames to accumulate (for STFT/ISTFT)",
+          "Total frames to accumulate (for STFT/ISTFT) - REQUIRED, must be > 0",
           0, 8192, DEFAULT_WINDOW_FRAMES,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_BATCH_SIZE,
       g_param_spec_uint ("batch-size", "Batch Size",
-          "Frames per batch (for STFT/ISTFT)",
+          "Frames per batch (for STFT/ISTFT) - optional, 0 = process all frames",
           0, 8192, DEFAULT_BATCH_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
-/* Calculate DMA buffer sizes based on operation type and parameters */
+/* Calculate DMA buffer sizes based on operation type and parameters
+ * Requirements: fft_size, hop_size, window_frames must be > 0 (set via pipeline)
+ * If user provided explicit buffer sizes (input_buf_size > 0 AND output_buf_size > 0),
+ * they are used as-is; otherwise buffers are calculated from parameters. */
 static void
 gst_dsp_kernel_calculate_buffer_sizes (GstDspKernel * kernel)
 {
   /* If user provided explicit buffer sizes, use them */
   if (kernel->input_buf_size > 0 && kernel->output_buf_size > 0) {
+    return;
+  }
+
+  /* Validate required parameters before calculation */
+  if (kernel->fft_size == 0) {
+    g_print ("[DSP] WARNING: fft_size is 0, cannot calculate buffer sizes\n");
     return;
   }
 
@@ -469,7 +479,7 @@ gst_dsp_kernel_init (GstDspKernel * kernel)
   kernel->expected_n_chunks = 0;
   kernel->chunk_buffer_counter = 0;
 
-  /* Chunking will be auto-detected in start() based on window_frames */
+  /* Chunking will be determined in start() based on window_frames > CHUNKING_THRESHOLD */
   kernel->enable_chunking = FALSE;
 
   memset (&kernel->dma_input, 0, sizeof (kernel->dma_input));
@@ -591,11 +601,28 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
 {
   GstDspKernel *kernel = GST_DSP_KERNEL (trans);
 
-  /* Ensure auto-detection has been done (should already be done in init) */
-  gst_dsp_kernel_auto_detect_operation (kernel);
-
-  /* Auto-calculate buffer sizes if not explicitly provided */
+  /* Auto-calculate buffer sizes based on pipeline parameters */
   gst_dsp_kernel_calculate_buffer_sizes (kernel);
+
+  /* Validate that required parameters are set (operation-specific) */
+  if (kernel->fft_size == 0) {
+    GST_ERROR_OBJECT (kernel,
+        "fft-size must be explicitly set in pipeline (> 0)");
+    return FALSE;
+  }
+  if (kernel->window_frames == 0) {
+    GST_ERROR_OBJECT (kernel,
+        "window-frames must be explicitly set in pipeline (> 0)");
+    return FALSE;
+  }
+
+  /* STFT/ISTFT require hop-size; Deinterleave/Interleave do not */
+  if ((kernel->msg_type == DSP_OP_STFT || kernel->msg_type == DSP_OP_ISTFT) &&
+      kernel->hop_size == 0) {
+    GST_ERROR_OBJECT (kernel,
+        "hop-size must be explicitly set in pipeline for STFT/ISTFT (> 0)");
+    return FALSE;
+  }
 
   /* Auto-detect chunking requirement based on model window size */
   if (kernel->window_frames > CHUNKING_THRESHOLD) {
@@ -1589,9 +1616,6 @@ gst_dsp_kernel_transform_caps (GstBaseTransform * trans,
 {
   GstDspKernel *kernel = GST_DSP_KERNEL (trans);
   GstCaps *ret = NULL;
-
-  /* Ensure auto-detection has been done (should already be done in init) */
-  gst_dsp_kernel_auto_detect_operation (kernel);
 
   GST_DEBUG_OBJECT (kernel,
       "transform_caps: direction=%s, msg_type=0x%04x, caps=%" GST_PTR_FORMAT,
