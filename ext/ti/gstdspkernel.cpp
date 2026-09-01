@@ -125,17 +125,11 @@ static_assert (sizeof (struct deint_interleave_msg) == 36,
 
 #define C7X_STATUS_SUCCESS 0
 
-/* Property IDs */
+/* Property IDs (user-facing parameters only) */
 enum
 {
   PROP_0,
-  PROP_RPROC_DEVICE,
-  PROP_RPROC_ID,
-  PROP_REMOTE_EP,
   PROP_MSG_TYPE,
-  PROP_MSG_RESP_TYPE,
-  PROP_INPUT_BUF_SIZE,
-  PROP_OUTPUT_BUF_SIZE,
   PROP_PARAM2,
   PROP_HOP_SIZE,
   PROP_FFT_SIZE,
@@ -221,47 +215,11 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
   bt->sink_event = GST_DEBUG_FUNCPTR (gst_dsp_kernel_sink_event);
   bt->passthrough_on_same_caps = FALSE;
 
-  /* Install properties */
-  g_object_class_install_property (gobject_class, PROP_RPROC_DEVICE,
-      g_param_spec_string ("rproc-device", "Remoteproc Device",
-          "Remoteproc cdev for DMA buffer physical address lookup",
-          DEFAULT_RPROC_DEVICE,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_RPROC_ID,
-      g_param_spec_uint ("rproc-id", "Remote Processor ID",
-          "Linux remoteproc core ID (8 = C7x_0 on AM62D)",
-          0, G_MAXUINT, DEFAULT_RPROC_ID,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_REMOTE_EP,
-      g_param_spec_uint ("remote-ep", "Remote RPMsg Endpoint",
-          "RPMsg endpoint number running DSP firmware",
-          0, G_MAXUINT, DEFAULT_REMOTE_EP,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
+  /* Install user-facing properties */
   g_object_class_install_property (gobject_class, PROP_MSG_TYPE,
       g_param_spec_uint ("msg-type", "DSP Message Type",
           "IPC message type (0x1020=STFT, 0x1030=ISTFT, 0x1040=De/Interleave)",
           0, G_MAXUINT, DEFAULT_MSG_TYPE,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_MSG_RESP_TYPE,
-      g_param_spec_uint ("msg-resp-type", "DSP Response Type",
-          "Expected response opcode (0 = auto-derive)",
-          0, G_MAXUINT, DEFAULT_MSG_RESP_TYPE,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_INPUT_BUF_SIZE,
-      g_param_spec_uint ("input-buf-size", "Input Buffer Size",
-          "DMA input buffer size in bytes (0 = auto-calculate based on window-frames, fft-size, hop-size)",
-          0, G_MAXUINT, DEFAULT_INPUT_BUF_SIZE,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_OUTPUT_BUF_SIZE,
-      g_param_spec_uint ("output-buf-size", "Output Buffer Size",
-          "DMA output buffer size in bytes (0 = auto-calculate based on window-frames, fft-size, hop-size)",
-          0, G_MAXUINT, DEFAULT_OUTPUT_BUF_SIZE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_PARAM2,
@@ -496,27 +454,8 @@ gst_dsp_kernel_set_property (GObject * object, guint prop_id,
   GstDspKernel *kernel = GST_DSP_KERNEL (object);
   GST_OBJECT_LOCK (kernel);
   switch (prop_id) {
-    case PROP_RPROC_DEVICE:
-      g_free (kernel->rproc_device);
-      kernel->rproc_device = g_value_dup_string (value);
-      break;
-    case PROP_RPROC_ID:
-      kernel->rproc_id = g_value_get_uint (value);
-      break;
-    case PROP_REMOTE_EP:
-      kernel->remote_ep = g_value_get_uint (value);
-      break;
     case PROP_MSG_TYPE:
       kernel->msg_type = g_value_get_uint (value);
-      break;
-    case PROP_MSG_RESP_TYPE:
-      kernel->msg_resp_type = g_value_get_uint (value);
-      break;
-    case PROP_INPUT_BUF_SIZE:
-      kernel->input_buf_size = g_value_get_uint (value);
-      break;
-    case PROP_OUTPUT_BUF_SIZE:
-      kernel->output_buf_size = g_value_get_uint (value);
       break;
     case PROP_PARAM2:
       kernel->param2 = g_value_get_uint (value);
@@ -546,26 +485,8 @@ gst_dsp_kernel_get_property (GObject * object, guint prop_id,
   GstDspKernel *kernel = GST_DSP_KERNEL (object);
   GST_OBJECT_LOCK (kernel);
   switch (prop_id) {
-    case PROP_RPROC_DEVICE:
-      g_value_set_string (value, kernel->rproc_device);
-      break;
-    case PROP_RPROC_ID:
-      g_value_set_uint (value, kernel->rproc_id);
-      break;
-    case PROP_REMOTE_EP:
-      g_value_set_uint (value, kernel->remote_ep);
-      break;
     case PROP_MSG_TYPE:
       g_value_set_uint (value, kernel->msg_type);
-      break;
-    case PROP_MSG_RESP_TYPE:
-      g_value_set_uint (value, kernel->msg_resp_type);
-      break;
-    case PROP_INPUT_BUF_SIZE:
-      g_value_set_uint (value, kernel->input_buf_size);
-      break;
-    case PROP_OUTPUT_BUF_SIZE:
-      g_value_set_uint (value, kernel->output_buf_size);
       break;
     case PROP_PARAM2:
       g_value_set_uint (value, kernel->param2);
