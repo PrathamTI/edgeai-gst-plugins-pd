@@ -68,12 +68,15 @@ if get_option('stft-plugins').enabled()
   ]
 endif
 
+# Include utility directory for gsttirpmsgctx headers
+utility_inc = include_directories('../../utility')
+
 # Build plugin library
 gst_ti_plugin = library('gstti',
   gst_ti_plugin_sources,
   c_args : c_args,
   cpp_args : cpp_args,
-  include_directories : [configinc],
+  include_directories : [configinc, utility_inc],
   install : true,
   install_dir : plugins_install_dir,
   dependencies : [plugin_deps, gst_internal_dep] ,
