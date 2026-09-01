@@ -247,20 +247,12 @@ gst_ti_tvm_class_init (GstTiTvmClass * klass)
       g_param_spec_string ("model-path", "Model Path",
           "Path to TVM artifacts directory", DEFAULT_MODEL_PATH,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_INPUT_SHAPE,
-      g_param_spec_string ("input-shape", "Input Shape",
-          "Input tensor shape as comma-separated dimensions (e.g., \"1,2,401,161\"). "
-          "Optional: will be auto-detected from deploy_graph.json if not specified.",
-          DEFAULT_INPUT_SHAPE,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
 static void
 gst_ti_tvm_init (GstTiTvm * tvm)
 {
   tvm->model_path = g_strdup (DEFAULT_MODEL_PATH);
-  tvm->input_shape = g_strdup (DEFAULT_INPUT_SHAPE);
 
   tvm->tvm_initialized = FALSE;
   tvm->graph_executor = NULL;
@@ -293,10 +285,6 @@ gst_ti_tvm_set_property (GObject * object, guint property_id,
       g_free (tvm->model_path);
       tvm->model_path = g_value_dup_string (value);
       break;
-    case PROP_INPUT_SHAPE:
-      g_free (tvm->input_shape);
-      tvm->input_shape = g_value_dup_string (value);
-      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -315,9 +303,6 @@ gst_ti_tvm_get_property (GObject * object, guint property_id,
   switch (property_id) {
     case PROP_MODEL_PATH:
       g_value_set_string (value, tvm->model_path);
-      break;
-    case PROP_INPUT_SHAPE:
-      g_value_set_string (value, tvm->input_shape);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -341,7 +326,6 @@ gst_ti_tvm_finalize (GObject * object)
       tvm = GST_TI_TVM (object);
 
   g_free (tvm->model_path);
-  g_free (tvm->input_shape);
   g_free (tvm->auto_input_name);
 
   if (tvm->auto_input_shape) {
@@ -647,9 +631,7 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
     tvm->get_output_func = get_output;
 
     GST_INFO_OBJECT (tvm,
-        "[TVM] Input configuration: index=0, shape=%s",
-        (tvm->input_shape
-            && strlen (tvm->input_shape) > 0) ? tvm->input_shape : "[dynamic]");
+        "[TVM] Input configuration: index=0 (auto-detected from JSON)");
 
     tvm->tvm_initialized = TRUE;
 
@@ -677,10 +659,9 @@ gst_ti_tvm_run_inference (GstTiTvm * tvm, gfloat * input_data, gsize input_size)
     PackedFunc *run = (PackedFunc *) tvm->run_func;
     PackedFunc *get_output = (PackedFunc *) tvm->get_output_func;
 
-    /* Determine input shape: priority order is auto-detected > property > flat 1D */
+    /* Determine input shape: auto-detect from JSON */
     std::vector < int64_t > shape;
 
-    /* Option 1: Use auto-detected shape from JSON if available */
     std::vector < int64_t > *auto_shape_ptr =
         static_cast < std::vector < int64_t > *>(tvm->auto_input_shape);
     if (auto_shape_ptr && !auto_shape_ptr->empty ()) {
@@ -705,50 +686,11 @@ gst_ti_tvm_run_inference (GstTiTvm * tvm, gfloat * input_data, gsize input_size)
       } else {
         GST_INFO_OBJECT (tvm, "[TVM] Using auto-detected shape");
       }
-    }
-    /* Option 2: Parse input shape from property if provided */
-    else if (tvm->input_shape && strlen (tvm->input_shape) > 0) {
-      gchar **shape_tokens = g_strsplit (tvm->input_shape, ",", -1);
-      if (shape_tokens) {
-        gint i = 0;
-        while (shape_tokens[i] != NULL) {
-          gchar *trimmed = g_strstrip (g_strdup (shape_tokens[i]));
-          if (strlen (trimmed) > 0) {
-            gint64 dim = g_ascii_strtoll (trimmed, NULL, 10);
-            if (dim > 0) {
-              shape.push_back (dim);
-            }
-          }
-          g_free (trimmed);
-          i++;
-        }
-        g_strfreev (shape_tokens);
-      }
-
-      /* Validate parsed shape matches input data size */
-      if (!shape.empty ()) {
-        gsize shape_elements = 1;
-        for (size_t i = 0; i < shape.size (); i++) {
-          shape_elements *= shape[i];
-        }
-        if (shape_elements != input_size) {
-          GST_ERROR_OBJECT (tvm,
-              "[TVM] Input shape [%s] requires %zu elements but got %zu floats",
-              tvm->input_shape, shape_elements, input_size);
-          return GST_FLOW_ERROR;
-        }
-        GST_INFO_OBJECT (tvm, "[TVM] Using input shape: [%s]",
-            tvm->input_shape);
-      } else {
-        GST_WARNING_OBJECT (tvm,
-            "[TVM] Failed to parse input-shape, using flat 1D shape");
-        shape = { static_cast < int64_t > (input_size) };
-      }
     } else {
       /* Default: flat 1D shape */
       shape = { static_cast < int64_t > (input_size) };
       GST_INFO_OBJECT (tvm,
-          "[TVM] No input-shape specified, using flat 1D shape: [%zu]",
+          "[TVM] No input shape auto-detected, using flat 1D shape: [%zu]",
           input_size);
     }
 

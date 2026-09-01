@@ -105,7 +105,6 @@ struct _GstTiTvm
 
     /* Properties */
     gchar *model_path;            /* Path to TVM artifacts directory */
-    gchar *input_shape;           /* Input tensor shape (e.g., "1,2,401,161") */
 
     /* TVM runtime state */
     gboolean tvm_initialized;     /* TVM runtime initialization status */
@@ -142,13 +141,11 @@ GType gst_ti_tvm_get_type (void);
 enum
 {
     PROP_0,
-    PROP_MODEL_PATH,
-    PROP_INPUT_SHAPE
+    PROP_MODEL_PATH
 };
 
 /* Default values */
 #define DEFAULT_MODEL_PATH ""
-#define DEFAULT_INPUT_SHAPE ""
 
 G_END_DECLS
 

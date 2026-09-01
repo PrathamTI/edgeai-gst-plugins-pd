@@ -64,7 +64,7 @@
 #include <gst/gst.h>
 #include <gst/base/gstbasetransform.h>
 #include <stdint.h>
-#include "../utility/gsttirpmsgctx.h"
+#include <gsttirpmsgctx.h>
 
 #ifdef __cplusplus
 extern "C" {
