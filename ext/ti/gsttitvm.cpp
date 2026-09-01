@@ -170,7 +170,7 @@ gst_ti_tvm_load_model (GstTiTvm * tvm);
 
 static
     GstFlowReturn
-gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm,
+gst_ti_tvm_run_inference (GstTiTvm * tvm,
     gfloat * input_data, gsize input_size);
 
 static gchar *
@@ -254,11 +254,6 @@ gst_ti_tvm_class_init (GstTiTvmClass * klass)
           "Optional: will be auto-detected from deploy_graph.json if not specified.",
           DEFAULT_INPUT_SHAPE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
-
-  g_object_class_install_property (gobject_class, PROP_BENCHMARK,
-      g_param_spec_boolean ("benchmark", "Benchmark",
-          "Enable performance benchmarking output", DEFAULT_BENCHMARK,
-          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
 static void
@@ -266,7 +261,6 @@ gst_ti_tvm_init (GstTiTvm * tvm)
 {
   tvm->model_path = g_strdup (DEFAULT_MODEL_PATH);
   tvm->input_shape = g_strdup (DEFAULT_INPUT_SHAPE);
-  tvm->benchmark = DEFAULT_BENCHMARK;
 
   tvm->tvm_initialized = FALSE;
   tvm->graph_executor = NULL;
@@ -303,9 +297,6 @@ gst_ti_tvm_set_property (GObject * object, guint property_id,
       g_free (tvm->input_shape);
       tvm->input_shape = g_value_dup_string (value);
       break;
-    case PROP_BENCHMARK:
-      tvm->benchmark = g_value_get_boolean (value);
-      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -327,9 +318,6 @@ gst_ti_tvm_get_property (GObject * object, guint property_id,
       break;
     case PROP_INPUT_SHAPE:
       g_value_set_string (value, tvm->input_shape);
-      break;
-    case PROP_BENCHMARK:
-      g_value_set_boolean (value, tvm->benchmark);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -522,7 +510,7 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
 
 
   /* Run inference benchmark */
-  ret = gst_ti_tvm_run_inference_benchmark (tvm, input_data, input_size);
+  ret = gst_ti_tvm_run_inference (tvm, input_data, input_size);
 
   /* Copy inference output to output buffer */
   if (ret == GST_FLOW_OK && tvm->final_output && tvm->output_num_floats > 0) {
@@ -682,8 +670,7 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
 }
 
 static GstFlowReturn
-gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
-    gsize input_size)
+gst_ti_tvm_run_inference (GstTiTvm * tvm, gfloat * input_data, gsize input_size)
 {
   try {
     PackedFunc *set_input = (PackedFunc *) tvm->set_input_func;
@@ -774,12 +761,6 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
     );
     input_array.CopyFromBytes (input_data, input_size * sizeof (float));
 
-
-    if (tvm->benchmark) {
-      g_print ("\n[TVM] Running inference...\n");
-      g_print ("------------------------------\n");
-    }
-
     /* Run single inference */
     auto start_time = std::chrono::high_resolution_clock::now ();
 
@@ -794,9 +775,6 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
     gdouble time_ms = duration.count () / 1000.0;
 
     tvm->perf_data.first_run_time = duration.count ();
-    if (tvm->benchmark) {
-      g_print ("Inference time: %.2f ms\n", time_ms);
-    }
 
     /* Get output shape */
     gsize out_floats = 1;
@@ -818,7 +796,7 @@ gst_ti_tvm_run_inference_benchmark (GstTiTvm * tvm, gfloat * input_data,
   }
   catch (const std::exception & e)
   {
-    GST_ERROR_OBJECT (tvm, "Inference benchmark failed: %s", e.what ());
+    GST_ERROR_OBJECT (tvm, "Inference failed: %s", e.what ());
     return GST_FLOW_ERROR;
   }
 }

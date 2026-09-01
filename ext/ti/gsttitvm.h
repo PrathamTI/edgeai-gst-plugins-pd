@@ -106,7 +106,6 @@ struct _GstTiTvm
     /* Properties */
     gchar *model_path;            /* Path to TVM artifacts directory */
     gchar *input_shape;           /* Input tensor shape (e.g., "1,2,401,161") */
-    gboolean benchmark;           /* Enable performance benchmarking */
 
     /* TVM runtime state */
     gboolean tvm_initialized;     /* TVM runtime initialization status */
@@ -144,14 +143,12 @@ enum
 {
     PROP_0,
     PROP_MODEL_PATH,
-    PROP_INPUT_SHAPE,
-    PROP_BENCHMARK
+    PROP_INPUT_SHAPE
 };
 
 /* Default values */
 #define DEFAULT_MODEL_PATH ""
 #define DEFAULT_INPUT_SHAPE ""
-#define DEFAULT_BENCHMARK TRUE
 
 G_END_DECLS
 
