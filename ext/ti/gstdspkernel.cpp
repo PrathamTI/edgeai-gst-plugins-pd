@@ -919,12 +919,100 @@ dsp_kernel_send_recv_deint (GstDspKernel * kernel,
   return GST_FLOW_OK;
 }
 
-/* STFT transform: always accumulate incoming audio; the actual DSP work
- * happens at EOS in dsp_kernel_process_chunks(), for both overlap-save
- * chunking (GCRN-like enhancement models) and plain non-overlapping
- * windowing (classification-style models, see gst_dsp_kernel_start()). */
+/* Process exactly one already-complete window of window_frames*hop_size
+ * audio samples immediately, batching it through the DSP the same way
+ * dsp_kernel_process_chunks() does, and pushing the resulting spectral
+ * buffer downstream right away. Used for live/streaming classification
+ * sources (e.g. a microphone) where EOS never arrives, so waiting for
+ * end-of-stream to process anything (like the GCRN overlap-save path
+ * does) would mean never producing output at all.
+ *
+ * GST_BUFFER_OFFSET chunk metadata is intentionally left unset here -
+ * the total window count is unknown for an open-ended live stream;
+ * downstream (titvm) already falls back to a plain running counter
+ * when no offset is present. */
 static GstFlowReturn
-dsp_kernel_transform_stft (GstDspKernel * kernel, GstBuffer * buf)
+dsp_kernel_process_stream_window (GstDspKernel * kernel,
+    GstBaseTransform * trans, const gint16 * window_audio)
+{
+  guint model_elems = gst_dsp_kernel_get_model_elems (kernel);
+  gsize bytes_per_frame = model_elems * sizeof (float);
+  gsize bytes_per_chunk = kernel->window_frames * bytes_per_frame;
+  guint8 *spectral = (guint8 *) g_malloc0 (bytes_per_chunk);
+  gsize offset_bytes = 0;
+  guint num_batches =
+      (kernel->window_frames + kernel->batch_size - 1) / kernel->batch_size;
+  guint batch_idx;
+  GstPad *srcpad;
+  GstBuffer *out_buf;
+  GstMemory *mem;
+  GstFlowReturn push_ret;
+
+  for (batch_idx = 0; batch_idx < num_batches; batch_idx++) {
+    guint frame_start = batch_idx * kernel->batch_size;
+    guint frames_in_batch = MIN (kernel->batch_size,
+        kernel->window_frames - frame_start);
+    gsize batch_bytes = frames_in_batch * kernel->hop_size * sizeof (gint16);
+    gsize sample_offset = frame_start * kernel->hop_size;
+    struct stft_istft_msg req = { }, resp = { };
+    gsize batch_spectral_bytes;
+
+    dmabuf_sync (kernel->dma_input.dma_buf_fd, DMA_BUF_SYNC_START);
+    memcpy (kernel->dma_input.kern_addr, window_audio + sample_offset,
+        batch_bytes);
+    dmabuf_sync (kernel->dma_input.dma_buf_fd, DMA_BUF_SYNC_END);
+
+    req.hdr.type = kernel->msg_type;
+    req.hdr.seq = kernel->sequence_number++;
+    req.hdr.len = sizeof (req);
+    req.selected_model = kernel->selected_model;
+    req.input_buffer = (uint32_t) kernel->dma_input.phys_addr;
+    req.output_buffer = (uint32_t) kernel->dma_output.phys_addr;
+    req.input_frame = frames_in_batch;
+    req.output_frame = frames_in_batch;
+
+    if (dsp_kernel_send_recv_stft (kernel, &req, &resp) != GST_FLOW_OK) {
+      GST_ERROR_OBJECT (kernel, "STFT: stream window batch %u failed",
+          batch_idx + 1);
+      g_free (spectral);
+      return GST_FLOW_ERROR;
+    }
+
+    batch_spectral_bytes = resp.output_frame * model_elems * sizeof (float);
+    dmabuf_sync (kernel->dma_output.dma_buf_fd, DMA_BUF_SYNC_START);
+    memcpy (spectral + offset_bytes, kernel->dma_output.kern_addr,
+        batch_spectral_bytes);
+    dmabuf_sync (kernel->dma_output.dma_buf_fd, DMA_BUF_SYNC_END);
+    offset_bytes += batch_spectral_bytes;
+  }
+
+  mem = gst_memory_new_wrapped ((GstMemoryFlags) 0, spectral, bytes_per_chunk,
+      0, bytes_per_chunk, spectral, g_free);
+  out_buf = gst_buffer_new ();
+  gst_buffer_append_memory (out_buf, mem);
+
+  srcpad = gst_element_get_static_pad (GST_ELEMENT (trans), "src");
+  push_ret = gst_pad_push (srcpad, out_buf);
+  gst_object_unref (srcpad);
+
+  if (push_ret != GST_FLOW_OK && push_ret != GST_FLOW_NOT_LINKED) {
+    GST_WARNING_OBJECT (kernel, "STFT: stream window push failed: %s",
+        gst_flow_get_name (push_ret));
+  }
+
+  return push_ret;
+}
+
+/* STFT transform: always accumulate incoming audio. For overlap-save
+ * chunking (GCRN-like enhancement models), the actual DSP work happens at
+ * EOS in dsp_kernel_process_chunks(). For plain non-overlapping windowing
+ * (classification-style models, see gst_dsp_kernel_start()), each complete
+ * window is instead processed immediately as it becomes available, so
+ * live sources (e.g. a microphone, which never sends EOS) produce output
+ * in real time rather than only once the pipeline stops. */
+static GstFlowReturn
+dsp_kernel_transform_stft (GstDspKernel * kernel, GstBaseTransform * trans,
+    GstBuffer * buf)
 {
   GstMapInfo map_info;
   if (!gst_buffer_map (buf, &map_info, GST_MAP_READWRITE)) {
@@ -952,10 +1040,32 @@ dsp_kernel_transform_stft (GstDspKernel * kernel, GstBuffer * buf)
       incoming_samples * sizeof (gint16));
   kernel->input_buffer_size += incoming_samples;
 
-  /* Return empty buffer - processing happens at EOS */
+  gst_buffer_unmap (buf, &map_info);
+
+  if (kernel->overlap_frames == 0) {
+    /* Plain windowing: drain every complete window right away. */
+    while (kernel->input_buffer_size >= kernel->chunk_samples) {
+      GstFlowReturn ret = dsp_kernel_process_stream_window (kernel, trans,
+          kernel->input_buffer);
+
+      if (ret != GST_FLOW_OK && ret != GST_FLOW_NOT_LINKED) {
+        gst_buffer_set_size (buf, 0);
+        return ret;
+      }
+
+      /* Shift remaining buffered samples down to the front */
+      kernel->input_buffer_size -= kernel->chunk_samples;
+      memmove (kernel->input_buffer,
+          kernel->input_buffer + kernel->chunk_samples,
+          kernel->input_buffer_size * sizeof (gint16));
+    }
+  }
+
+  /* Return empty buffer - overlap-save chunks (if any) are finished at
+   * EOS by dsp_kernel_process_chunks(); classification windows (if any
+   * were ready) were already pushed above. */
   gst_buffer_set_size (buf, 0);
 
-  gst_buffer_unmap (buf, &map_info);
   return GST_FLOW_OK;
 }
 
@@ -1700,7 +1810,7 @@ gst_dsp_kernel_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
 
   switch (kernel->msg_type) {
     case DSP_OP_STFT:
-      return dsp_kernel_transform_stft (kernel, buf);
+      return dsp_kernel_transform_stft (kernel, trans, buf);
     case DSP_OP_ISTFT:
       return dsp_kernel_transform_istft (kernel, buf);
     case DSP_OP_DEINT_INTERLEAVE:
