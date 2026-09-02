@@ -105,6 +105,11 @@ struct _GstTiTvm
 
     /* Properties */
     gchar *model_path;            /* Path to TVM artifacts directory */
+    gchar *class_map_path;        /* Optional: YAML file of ordered class names for
+                                    * live top-k printing (e.g. yamnet_class_map.yml).
+                                    * Empty = printing disabled (default, no-op for
+                                    * non-classification models like GCRN). */
+    guint top_k;                  /* Number of top predictions to print per window */
 
     /* TVM runtime state */
     gboolean tvm_initialized;     /* TVM runtime initialization status */
@@ -122,11 +127,23 @@ struct _GstTiTvm
     void *final_output;           /* Final inference output buffer */
     gsize output_num_floats;      /* Dynamic output size determined at inference time */
 
+    /* tvm-model-daemon client state (preferred path: the DSP compute
+     * channel only supports one client, and tvm-model-daemon already
+     * owns it on boards where it is running). */
+    gint daemon_fd;                /* fd to /var/run/tvm-inference.sock, -1 if not connected */
+    gfloat *daemon_output_buf;     /* latest inference output received from the daemon */
+    gsize daemon_output_buf_size;  /* allocated size (in floats) of daemon_output_buf */
+
     /* Performance tracking */
     struct TiTvmPerformanceData perf_data;
 
     /* Execution state */
     gboolean inference_completed; /* Whether inference has run */
+
+    /* Live top-k prediction printing (class-map-path) */
+    gchar **class_names;          /* Ordered class names parsed from class-map-path */
+    guint num_class_names;
+    guint window_counter;         /* Windows processed so far, for "N/?" style logging */
 };
 
 struct _GstTiTvmClass
@@ -141,11 +158,15 @@ GType gst_ti_tvm_get_type (void);
 enum
 {
     PROP_0,
-    PROP_MODEL_PATH
+    PROP_MODEL_PATH,
+    PROP_CLASS_MAP_PATH,
+    PROP_TOP_K
 };
 
 /* Default values */
 #define DEFAULT_MODEL_PATH ""
+#define DEFAULT_CLASS_MAP_PATH ""
+#define DEFAULT_TOP_K 3
 
 G_END_DECLS
 

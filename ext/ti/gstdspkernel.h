@@ -108,6 +108,11 @@ struct _GstDspKernel {
     guint    fft_size;          /* For STFT/ISTFT */
     guint    window_frames;     /* For STFT/ISTFT */
     guint    batch_size;        /* For STFT/ISTFT */
+    guint    selected_model;    /* Firmware ModelId sent in STFT/ISTFT requests (2=GCRN default) */
+    guint    model_elems;       /* Spectral elements/frame; 0 = derive from fft_size (GCRN formula) */
+    gchar   *model_path;        /* Optional: artifacts dir, e.g. ".../artifacts_yamnet". When set,
+                                  * selected-model/model-elems are derived from a known model name
+                                  * in the path, overriding the properties above. */
 
     /* RPMsg and DMA */
     GstTiRpmsgChan *rpmsg_chan;
