@@ -138,6 +138,8 @@ enum
   PROP_SELECTED_MODEL,
   PROP_MODEL_ELEMS,
   PROP_MODEL_PATH,
+  PROP_OVERLAP_FRAMES,
+  PROP_CHUNKING_MODE,
 };
 
 /* Defaults for infrastructure parameters */
@@ -157,6 +159,8 @@ enum
 #define DEFAULT_SELECTED_MODEL  2       /* MODEL_GCRN, matches prior hardcoded behavior */
 #define DEFAULT_MODEL_ELEMS     0       /* 0 = derive from fft-size (GCRN formula) */
 #define DEFAULT_MODEL_PATH      ""      /* empty = use selected-model/model-elems as-is */
+#define DEFAULT_OVERLAP_FRAMES  100     /* GCRN's overlap-save overlap amount */
+#define DEFAULT_CHUNKING_MODE   (-1)    /* auto: derive from CHUNKING_THRESHOLD */
 
 /* Known model names (matched as a case-insensitive substring of model-path,
  * e.g. ".../artifacts_yamnet") to firmware ModelId + model_elems. Values
@@ -319,7 +323,10 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
   g_object_class_install_property (gobject_class, PROP_SELECTED_MODEL,
       g_param_spec_uint ("selected-model", "Selected Model",
           "Firmware ModelId sent in STFT/ISTFT requests "
-          "(0=DCCRN, 1=GTCRN, 2=GCRN, 3=VGGISH, 4=YAMNET)",
+          "(0=DCCRN, 1=GTCRN, 2=GCRN, 3=VGGISH, 4=YAMNET). This ID must "
+          "match a model compiled into the DSP firmware - it is a "
+          "firmware/plugin co-design constant, not something the plugin "
+          "can infer for a model the firmware doesn't already know about.",
           0, G_MAXUINT, DEFAULT_SELECTED_MODEL,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
@@ -334,8 +341,28 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
       g_param_spec_string ("model-path", "Model Path",
           "Optional: TVM artifacts directory (e.g. '.../artifacts_yamnet'). "
           "When set, selected-model and model-elems are derived from a known "
-          "model name found in this path, overriding those properties.",
+          "model name found in this path, overriding those properties. A "
+          "non-empty path that matches no known model name fails start() "
+          "loudly rather than silently defaulting to GCRN's values - set "
+          "selected-model/model-elems explicitly instead for other models.",
           DEFAULT_MODEL_PATH,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property (gobject_class, PROP_OVERLAP_FRAMES,
+      g_param_spec_uint ("overlap-frames", "Overlap Frames",
+          "Overlap-save overlap amount in frames, used only when overlap-save "
+          "chunking is active. Default (100) matches GCRN; models needing "
+          "overlap-save with a different overlap must set this explicitly.",
+          0, 8192, DEFAULT_OVERLAP_FRAMES,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property (gobject_class, PROP_CHUNKING_MODE,
+      g_param_spec_int ("chunking-mode", "Chunking Mode",
+          "-1 = auto-detect from window-frames vs internal threshold "
+          "(back-compat default), 0 = force plain windowing (no overlap-save), "
+          "1 = force overlap-save chunking. The auto-detect heuristic is "
+          "tuned for the three known models and is not a general rule.",
+          -1, 1, DEFAULT_CHUNKING_MODE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
 
@@ -343,26 +370,39 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
  * Requirements: fft_size, hop_size, window_frames must be > 0 (set via pipeline)
  * If user provided explicit buffer sizes (input_buf_size > 0 AND output_buf_size > 0),
  * they are used as-is; otherwise buffers are calculated from parameters. */
-static void
+static gboolean
 gst_dsp_kernel_calculate_buffer_sizes (GstDspKernel * kernel)
 {
   /* If user provided explicit buffer sizes, use them */
   if (kernel->input_buf_size > 0 && kernel->output_buf_size > 0) {
-    return;
+    return TRUE;
   }
 
   /* model-path takes precedence over selected-model/model-elems: derive
-   * both from a known model name found in the artifacts path. */
-  if (gst_dsp_kernel_detect_model_from_path (kernel->model_path,
-          &kernel->selected_model, &kernel->model_elems)) {
-    g_print ("[DSP] Detected model from model-path '%s': selected-model=%u, "
-        "model-elems=%u\n", kernel->model_path, kernel->selected_model,
-        kernel->model_elems);
+   * both from a known model name found in the artifacts path. A non-empty
+   * model-path that matches nothing in dsp_kernel_known_models[] must fail
+   * loudly here - silently falling through would leave selected_model/
+   * model_elems at their GCRN defaults and process an unknown model with
+   * the wrong firmware ModelId and wrong buffer sizes. */
+  if (kernel->model_path && kernel->model_path[0] != '\0') {
+    if (gst_dsp_kernel_detect_model_from_path (kernel->model_path,
+            &kernel->selected_model, &kernel->model_elems)) {
+      g_print ("[DSP] Detected model from model-path '%s': selected-model=%u, "
+          "model-elems=%u\n", kernel->model_path, kernel->selected_model,
+          kernel->model_elems);
+    } else {
+      GST_ERROR_OBJECT (kernel,
+          "model-path '%s' does not match any known model "
+          "(dccrn/gtcrn/gcrn/vggish/yamnet). Set selected-model and "
+          "model-elems explicitly instead of relying on model-path "
+          "auto-detection for models outside this table.", kernel->model_path);
+      return FALSE;
+    }
   }
 
   if (kernel->model_elems == 0 && kernel->fft_size == 0) {
     g_print ("[DSP] WARNING: fft_size is 0, cannot calculate buffer sizes\n");
-    return;
+    return TRUE;
   }
 
   guint model_elems = gst_dsp_kernel_get_model_elems (kernel);
@@ -428,6 +468,8 @@ gst_dsp_kernel_calculate_buffer_sizes (GstDspKernel * kernel)
           kernel->msg_type);
       break;
   }
+
+  return TRUE;
 }
 
 /* Auto-detect operation type from element name */
@@ -498,6 +540,8 @@ gst_dsp_kernel_init (GstDspKernel * kernel)
   kernel->selected_model = DEFAULT_SELECTED_MODEL;
   kernel->model_elems = DEFAULT_MODEL_ELEMS;
   kernel->model_path = g_strdup (DEFAULT_MODEL_PATH);
+  kernel->overlap_frames_prop = DEFAULT_OVERLAP_FRAMES;
+  kernel->chunking_mode = DEFAULT_CHUNKING_MODE;
 
   kernel->rpmsg_chan = NULL;
   kernel->sequence_number = 1;
@@ -574,6 +618,12 @@ gst_dsp_kernel_set_property (GObject * object, guint prop_id,
       g_free (kernel->model_path);
       kernel->model_path = g_value_dup_string (value);
       break;
+    case PROP_OVERLAP_FRAMES:
+      kernel->overlap_frames_prop = g_value_get_uint (value);
+      break;
+    case PROP_CHUNKING_MODE:
+      kernel->chunking_mode = g_value_get_int (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -614,6 +664,12 @@ gst_dsp_kernel_get_property (GObject * object, guint prop_id,
     case PROP_MODEL_PATH:
       g_value_set_string (value, kernel->model_path);
       break;
+    case PROP_OVERLAP_FRAMES:
+      g_value_set_uint (value, kernel->overlap_frames_prop);
+      break;
+    case PROP_CHUNKING_MODE:
+      g_value_set_int (value, kernel->chunking_mode);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
   }
@@ -640,7 +696,9 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
   gst_dsp_kernel_auto_detect_operation (kernel);
 
   /* Auto-calculate buffer sizes based on pipeline parameters */
-  gst_dsp_kernel_calculate_buffer_sizes (kernel);
+  if (!gst_dsp_kernel_calculate_buffer_sizes (kernel)) {
+    return FALSE;
+  }
 
   /* Validate that required parameters are set (operation-specific).
    * fft-size is only needed to derive model_elems via the GCRN formula;
@@ -668,8 +726,18 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
     return FALSE;
   }
 
-  /* Auto-detect chunking requirement based on model window size */
-  if (kernel->window_frames > CHUNKING_THRESHOLD) {
+  /* Chunking mode: explicit chunking-mode property wins; otherwise fall
+   * back to the window_frames-vs-CHUNKING_THRESHOLD heuristic. The
+   * heuristic is a convenience for the three known models, not a rule -
+   * a new model whose window size happens to straddle the threshold but
+   * needs the opposite behavior must set chunking-mode explicitly. */
+  if (kernel->chunking_mode == 0) {
+    kernel->enable_chunking = FALSE;
+    g_print ("[DSP] chunking-mode=0 (forced): plain windowing\n");
+  } else if (kernel->chunking_mode == 1) {
+    kernel->enable_chunking = TRUE;
+    g_print ("[DSP] chunking-mode=1 (forced): overlap-save chunking\n");
+  } else if (kernel->window_frames > CHUNKING_THRESHOLD) {
     kernel->enable_chunking = TRUE;
     g_print ("[DSP] Large window_frames=%u (> %u threshold), "
         "enabling overlap-save chunking for GCRN-like models\n",
@@ -691,7 +759,7 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
         g_print ("[DSP] STFT: initializing overlap-save chunking\n");
 
         /* Initialize overlap-save parameters */
-        kernel->overlap_frames = 100;
+        kernel->overlap_frames = kernel->overlap_frames_prop;
         kernel->t_frames = kernel->overlap_frames / 2;
         kernel->hop_frames = kernel->window_frames - kernel->overlap_frames;
         kernel->hop_samples = kernel->hop_frames * kernel->hop_size;

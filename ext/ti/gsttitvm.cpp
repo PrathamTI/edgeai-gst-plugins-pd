@@ -1010,10 +1010,15 @@ gst_ti_tvm_run_inference_daemon (GstTiTvm * tvm, gfloat * input_data,
   gsize out_floats = resp_hdr.len / sizeof (gfloat);
 
   if (out_floats != input_size) {
-    GST_WARNING_OBJECT (tvm,
-        "[TVM] Daemon returned %zu floats, expected %zu (same-shape model) "
-        "- output/interleave buffers may be misaligned", out_floats,
-        input_size);
+    /* Expected for classification models (e.g. YAMNet/VGGish), whose output
+     * is a small set of class scores rather than same-shape spectral data
+     * like GCRN. Only same-shape models (whose downstream expects an
+     * interleave stage to consume this buffer) require out_floats ==
+     * input_size; that mismatch would surface as a size error there. */
+    GST_DEBUG_OBJECT (tvm,
+        "[TVM] Daemon returned %zu floats (input was %zu floats) - shape "
+        "differs from input, as expected for classification-style models",
+        out_floats, input_size);
   }
 
   if (out_floats > tvm->daemon_output_buf_size) {

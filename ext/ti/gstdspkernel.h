@@ -113,6 +113,12 @@ struct _GstDspKernel {
     gchar   *model_path;        /* Optional: artifacts dir, e.g. ".../artifacts_yamnet". When set,
                                   * selected-model/model-elems are derived from a known model name
                                   * in the path, overriding the properties above. */
+    guint    overlap_frames_prop; /* User-configurable overlap-save overlap amount (frames).
+                                    * Default 100 matches GCRN; other models needing overlap-save
+                                    * chunking with a different overlap must set this explicitly. */
+    gint     chunking_mode;     /* -1 = auto (CHUNKING_THRESHOLD heuristic on window_frames),
+                                  * 0 = force plain windowing (no overlap-save),
+                                  * 1 = force overlap-save chunking. */
 
     /* RPMsg and DMA */
     GstTiRpmsgChan *rpmsg_chan;
