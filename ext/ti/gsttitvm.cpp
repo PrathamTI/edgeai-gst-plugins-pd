@@ -103,6 +103,13 @@ using namespace
 #define TVM_DAEMON_SOCKET_PATH "/var/run/tvm-inference.sock"
 #define TVM_DAEMON_MAGIC       0x544D5644u      /* 'TMVD' */
 
+/* tvm-model-daemon persistently holds exactly one loaded model (the DSP
+ * compute channel only supports one client). This is the same cache file
+ * the reference rpmsg-dma-pd app's pipeline_manager uses to detect a
+ * model switch and restart the daemon - see gst_ti_tvm_ensure_daemon_model
+ * below, which mirrors that logic. */
+#define TVM_MODEL_CACHE_FILE "/var/lib/tvm_inference/loaded_model"
+
 enum TvmDaemonMsgType
 {
   TVM_DAEMON_MSG_PING = 0,
@@ -205,6 +212,9 @@ gst_ti_tvm_load_model (GstTiTvm * tvm);
 static
     gint
 gst_ti_tvm_daemon_connect (GstTiTvm * tvm);
+
+static void
+gst_ti_tvm_ensure_daemon_model (GstTiTvm * tvm);
 
 static
     GstFlowReturn
@@ -704,7 +714,11 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
     /* Prefer the shared tvm-model-daemon: the DSP compute channel only
      * supports one client, and on boards running the daemon it already
      * owns that session. Loading the graph executor in-process here would
-     * make a second, competing c7x_client_open() call and fail. */
+     * make a second, competing c7x_client_open() call and fail. If the
+     * daemon has a *different* model loaded than model-path, switch it
+     * over first - otherwise every inference request would silently fail
+     * with a shape/element-count mismatch against the wrong model. */
+    gst_ti_tvm_ensure_daemon_model (tvm);
     tvm->daemon_fd = gst_ti_tvm_daemon_connect (tvm);
     if (tvm->daemon_fd >= 0) {
       g_free (graph_json);
@@ -824,6 +838,80 @@ gst_ti_tvm_daemon_write_full (gint fd, gconstpointer buf, gsize size)
   }
 
   return TRUE;
+}
+
+/* Strip trailing '/' characters so path comparisons/writes are stable
+ * regardless of whether the caller included a trailing slash. */
+static gchar *
+gst_ti_tvm_normalize_path (const gchar * path)
+{
+  gchar *copy = g_strdup (path);
+  gsize len = strlen (copy);
+
+  while (len > 0 && copy[len - 1] == '/') {
+    copy[len - 1] = '\0';
+    len--;
+  }
+
+  return copy;
+}
+
+/* Mirrors pipeline_manager.cpp's model-switch logic in the reference
+ * rpmsg-dma-pd app: tvm-model-daemon persistently holds exactly one
+ * loaded model (the DSP compute channel only supports one client). If
+ * the cached path doesn't match model-path, write the new path and
+ * restart the daemon, then poll for its socket to reappear before
+ * returning - otherwise gst_ti_tvm_daemon_connect() below would happily
+ * connect to a daemon serving the *wrong* model, and every inference
+ * request would fail with a shape/element-count mismatch. */
+static void
+gst_ti_tvm_ensure_daemon_model (GstTiTvm * tvm)
+{
+  gchar *wanted = gst_ti_tvm_normalize_path (tvm->model_path);
+  gchar *cached_raw = NULL;
+  gboolean needs_restart = TRUE;
+  gint i;
+
+  if (g_file_get_contents (TVM_MODEL_CACHE_FILE, &cached_raw, NULL, NULL)) {
+    gchar *cached = gst_ti_tvm_normalize_path (g_strstrip (cached_raw));
+    needs_restart = (g_strcmp0 (cached, wanted) != 0);
+    g_free (cached);
+  }
+  g_free (cached_raw);
+
+  if (!needs_restart) {
+    g_free (wanted);
+    return;
+  }
+
+  GST_INFO_OBJECT (tvm, "[TVM] Model cache mismatch, switching daemon to: %s",
+      wanted);
+  g_print ("[TVM] Model changed, restarting tvm-model-daemon for: %s\n",
+      wanted);
+
+  if (system ("mkdir -p /var/lib/tvm_inference") != 0) {
+    GST_WARNING_OBJECT (tvm, "[TVM] Failed to create model cache directory");
+  }
+
+  if (!g_file_set_contents (TVM_MODEL_CACHE_FILE, wanted, -1, NULL)) {
+    GST_WARNING_OBJECT (tvm, "[TVM] Failed to write model cache file: %s",
+        TVM_MODEL_CACHE_FILE);
+  }
+
+  if (system ("systemctl restart tvm-model-daemon") != 0) {
+    GST_WARNING_OBJECT (tvm, "[TVM] Failed to restart tvm-model-daemon");
+  }
+
+  for (i = 0; i < 60; i++) {
+    g_usleep (G_USEC_PER_SEC);
+    if (g_file_test (TVM_DAEMON_SOCKET_PATH, G_FILE_TEST_EXISTS)) {
+      GST_INFO_OBJECT (tvm, "[TVM] Daemon ready");
+      g_print ("[TVM] Daemon ready.\n");
+      break;
+    }
+  }
+
+  g_free (wanted);
 }
 
 /* Connect to tvm-model-daemon and perform the PING/PONG handshake.
@@ -1198,17 +1286,22 @@ gst_ti_tvm_load_param_file (const gchar * file_path, gsize * file_size)
   return contents;
 }
 
-/* Parse an ordered list of class names out of a YAML file shaped like
- * yamnet_class_map.yml:
- *   - id: /m/09x0r
- *     name: Speech
- *   - id: /m/0ytgt
- *     name: Child speech, kid speaking
- * Only the "name:" scalar on each entry is needed (in file order, which is
- * the class index order the model output uses) - avoids pulling in a full
- * YAML parser for this one flat, non-nested structure. No-op (leaves
- * class_names NULL) when class_map_path is unset, so printing stays
- * disabled by default for non-classification models. */
+/* Parse an ordered list of class names out of either:
+ *  - a YAML file shaped like yamnet_class_map.yml:
+ *      - id: /m/09x0r
+ *        name: Speech
+ *    (only the "name:" scalar on each entry is needed, in file order,
+ *    which is the class index order the model output uses - avoids
+ *    pulling in a full YAML parser for this one flat, non-nested
+ *    structure), or
+ *  - a plain newline-separated list like vggish_label_list.txt:
+ *      Air conditioner
+ *      Car horn
+ *      ...
+ * The two are told apart by whether any "name:" line is found; if not,
+ * every non-empty line is treated as a class name directly.
+ * No-op (leaves class_names NULL) when class_map_path is unset, so
+ * printing stays disabled by default for non-classification models. */
 static void
 gst_ti_tvm_load_class_map (GstTiTvm * tvm)
 {
@@ -1244,6 +1337,17 @@ gst_ti_tvm_load_class_map (GstTiTvm * tvm)
       g_ptr_array_add (names, g_strdup (name));
     }
   }
+
+  if (names->len == 0) {
+    /* No YAML "name:" lines found - fall back to plain-list format,
+     * one class name per non-empty line. */
+    for (i = 0; lines[i] != NULL; i++) {
+      gchar *line = g_strstrip (lines[i]);
+      if (line[0] != '\0')
+        g_ptr_array_add (names, g_strdup (line));
+    }
+  }
+
   g_strfreev (lines);
   g_free (contents);
 
