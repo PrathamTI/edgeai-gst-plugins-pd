@@ -1178,9 +1178,8 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
     guint frame_start = batch_idx * kernel->batch_size;
     guint frames_in_batch =
         MIN (kernel->batch_size, kernel->window_frames - frame_start);
-    /* Calculate expected spectral bytes for this batch
-     * Per frame = (FFT_SIZE/2 + 1) * 2 * sizeof(float) */
-    guint bins_per_frame = (kernel->fft_size / 2 + 1) * 2;
+    /* Calculate expected spectral bytes for this batch */
+    guint bins_per_frame = gst_dsp_kernel_get_model_elems (kernel);
     gsize batch_spectral_bytes =
         frames_in_batch * bins_per_frame * sizeof (float);
 
@@ -1513,7 +1512,8 @@ dsp_kernel_transform_deint_interleave (GstDspKernel * kernel, GstBuffer * buf)
   /* Validate input size matches expected spectral data size
    * For GCRN: 401 frames × 322 floats/frame × 4 bytes = 516488 bytes */
   guint expected_size =
-      kernel->window_frames * ((kernel->fft_size / 2 + 1) * 2) * sizeof (float);
+      kernel->window_frames * gst_dsp_kernel_get_model_elems (kernel) *
+      sizeof (float);
   if (input_size != expected_size) {
     GST_WARNING_OBJECT (kernel, "%s: Input size %zu != expected %u bytes "
         "(frames=%u fft_size=%u)", op_name, input_size, expected_size,
