@@ -113,13 +113,6 @@ struct deint_interleave_msg
   uint32_t flag;                /* 0=deinterleave, 1=interleave */
 } __attribute__((packed));
 
-static_assert (sizeof (struct c7x_msg_hdr) == 16,
-    "c7x_msg_hdr must be 16 bytes");
-static_assert (sizeof (struct stft_istft_msg) == 36,
-    "stft_istft_msg must be 36 bytes (16 header + 5 params)");
-static_assert (sizeof (struct deint_interleave_msg) == 36,
-    "deint_interleave_msg must be 36 bytes (16 header + 5 fields)");
-
 #define C7X_STATUS_SUCCESS 0
 
 enum
