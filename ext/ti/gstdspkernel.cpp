@@ -91,41 +91,37 @@ struct c7x_msg_hdr
   int32_t status;
 } __attribute__((packed));
 
-/* STFT/ISTFT message structure - MUST match C app format with 5 params!
- * C app uses: param0=selected_model, param1=input_buf, param2=output_buf, param3=input_frame, param4=output_frame
- * NOT the direct struct approach! */
+/* Wire format for STFT/ISTFT requests: 5 fixed params after the header. */
 struct stft_istft_msg
 {
   struct c7x_msg_hdr hdr;
-  uint32_t selected_model;      /* param0: model ID (0 for GCRN) */
+  uint32_t selected_model;      /* param0: firmware ModelId */
   uint32_t input_buffer;        /* param1: Physical address of input DMA buffer */
   uint32_t output_buffer;       /* param2: Physical address of output DMA buffer */
   uint32_t input_frame;         /* param3: Number of frames to process */
-  uint32_t output_frame;        /* param4: Must equal input_frame */
+  uint32_t output_frame;        /* param4: Always equals input_frame - STFT/ISTFT
+                                 * are frame-synchronous regardless of model */
 } __attribute__((packed));
 
-/* Deinterleave/Interleave message structure (matches DSP firmware) */
 struct deint_interleave_msg
 {
   struct c7x_msg_hdr hdr;
   uint32_t input_buffer;        /* Physical address of input DMA buffer */
   uint32_t output_buffer;       /* Physical address of output DMA buffer */
-  uint32_t input_frame;         /* Number of time frames (401 for GCRN) */
-  uint32_t fft_size;            /* FFT size (320 for GCRN) */
+  uint32_t input_frame;         /* Number of time frames */
+  uint32_t fft_size;            /* FFT size */
   uint32_t flag;                /* 0=deinterleave, 1=interleave */
 } __attribute__((packed));
 
-/* Compile-time assertions to ensure message sizes match DSP firmware */
 static_assert (sizeof (struct c7x_msg_hdr) == 16,
     "c7x_msg_hdr must be 16 bytes");
 static_assert (sizeof (struct stft_istft_msg) == 36,
-    "stft_istft_msg must be 36 bytes (16 header + 5 params to match C app format)");
+    "stft_istft_msg must be 36 bytes (16 header + 5 params)");
 static_assert (sizeof (struct deint_interleave_msg) == 36,
     "deint_interleave_msg must be 36 bytes (16 header + 5 fields)");
 
 #define C7X_STATUS_SUCCESS 0
 
-/* Property IDs (user-facing parameters only) */
 enum
 {
   PROP_0,
@@ -142,7 +138,7 @@ enum
   PROP_CHUNKING_MODE,
 };
 
-/* Defaults for infrastructure parameters */
+/* RPMsg/DMA infrastructure defaults */
 #define DEFAULT_RPROC_DEVICE    "/dev/remoteproc0"
 #define DEFAULT_RPROC_ID        8
 #define DEFAULT_REMOTE_EP       13
@@ -152,19 +148,23 @@ enum
 #define DEFAULT_OUTPUT_BUF_SIZE 0
 #define DEFAULT_PARAM2          0
 
+/* STFT/ISTFT/Deinterleave parameter defaults (0 = must be set explicitly) */
 #define DEFAULT_HOP_SIZE        0
 #define DEFAULT_FFT_SIZE        0
 #define DEFAULT_WINDOW_FRAMES   0
 #define DEFAULT_BATCH_SIZE      0
-#define DEFAULT_SELECTED_MODEL  2       /* MODEL_GCRN, matches prior hardcoded behavior */
-#define DEFAULT_MODEL_ELEMS     0       /* 0 = derive from fft-size (GCRN formula) */
+
+/* Model identification defaults */
+#define DEFAULT_SELECTED_MODEL  2       /* GCRN, matches prior hardcoded behavior */
+#define DEFAULT_MODEL_ELEMS     0       /* 0 = derive from fft-size */
 #define DEFAULT_MODEL_PATH      ""      /* empty = use selected-model/model-elems as-is */
+
+/* Overlap-save chunking defaults */
 #define DEFAULT_OVERLAP_FRAMES  100     /* GCRN's overlap-save overlap amount */
 #define DEFAULT_CHUNKING_MODE   (-1)    /* auto: derive from CHUNKING_THRESHOLD */
 
-/* Known model names (matched as a case-insensitive substring of model-path,
- * e.g. ".../artifacts_yamnet") to firmware ModelId + model_elems. Values
- * taken from mcu_plus_sdk's per-model TISP_*_signal_chain_memory_map.hpp. */
+/* Known model names (case-insensitive substring of model-path) mapped to
+ * firmware ModelId + spectral elements per frame. */
 struct DspKernelModelInfo
 {
   const gchar *name;
@@ -208,10 +208,7 @@ gst_dsp_kernel_detect_model_from_path (const gchar * model_path,
   return found;
 }
 
-/* Spectral elements per frame: explicit model-elems/model-path detection
- * takes precedence; otherwise fall back to the GCRN formula derived from
- * fft-size. Shared by buffer-size calculation and chunk processing so they
- * never disagree with each other. */
+/* Spectral elements per frame: explicit model-elems wins, else derive from fft-size. */
 static guint
 gst_dsp_kernel_get_model_elems (GstDspKernel * kernel)
 {
@@ -322,11 +319,10 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_SELECTED_MODEL,
       g_param_spec_uint ("selected-model", "Selected Model",
-          "Firmware ModelId sent in STFT/ISTFT requests "
-          "(0=DCCRN, 1=GTCRN, 2=GCRN, 3=VGGISH, 4=YAMNET). This ID must "
-          "match a model compiled into the DSP firmware - it is a "
-          "firmware/plugin co-design constant, not something the plugin "
-          "can infer for a model the firmware doesn't already know about.",
+          "Firmware ModelId sent in STFT/ISTFT requests (0=DCCRN, 1=GTCRN, "
+          "2=GCRN, 3=VGGISH, 4=YAMNET). Must match a model compiled into "
+          "the DSP firmware; the plugin cannot infer an ID the firmware "
+          "doesn't already know.",
           0, G_MAXUINT, DEFAULT_SELECTED_MODEL,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
@@ -340,28 +336,23 @@ gst_dsp_kernel_class_init (GstDspKernelClass * klass)
   g_object_class_install_property (gobject_class, PROP_MODEL_PATH,
       g_param_spec_string ("model-path", "Model Path",
           "Optional: TVM artifacts directory (e.g. '.../artifacts_yamnet'). "
-          "When set, selected-model and model-elems are derived from a known "
-          "model name found in this path, overriding those properties. A "
-          "non-empty path that matches no known model name fails start() "
-          "loudly rather than silently defaulting to GCRN's values - set "
-          "selected-model/model-elems explicitly instead for other models.",
+          "Derives selected-model/model-elems from a known model name in "
+          "this path; an unrecognized non-empty path fails start() loudly "
+          "rather than defaulting to GCRN's values.",
           DEFAULT_MODEL_PATH,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_OVERLAP_FRAMES,
       g_param_spec_uint ("overlap-frames", "Overlap Frames",
           "Overlap-save overlap amount in frames, used only when overlap-save "
-          "chunking is active. Default (100) matches GCRN; models needing "
-          "overlap-save with a different overlap must set this explicitly.",
+          "chunking is active. Default (100) matches GCRN.",
           0, 8192, DEFAULT_OVERLAP_FRAMES,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_CHUNKING_MODE,
       g_param_spec_int ("chunking-mode", "Chunking Mode",
           "-1 = auto-detect from window-frames vs internal threshold "
-          "(back-compat default), 0 = force plain windowing (no overlap-save), "
-          "1 = force overlap-save chunking. The auto-detect heuristic is "
-          "tuned for the three known models and is not a general rule.",
+          "(default), 0 = force plain windowing, 1 = force overlap-save.",
           -1, 1, DEFAULT_CHUNKING_MODE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 }
@@ -378,17 +369,15 @@ gst_dsp_kernel_calculate_buffer_sizes (GstDspKernel * kernel)
     return TRUE;
   }
 
-  /* model-path takes precedence over selected-model/model-elems: derive
-   * both from a known model name found in the artifacts path. A non-empty
-   * model-path that matches nothing in dsp_kernel_known_models[] must fail
-   * loudly here - silently falling through would leave selected_model/
-   * model_elems at their GCRN defaults and process an unknown model with
-   * the wrong firmware ModelId and wrong buffer sizes. */
+  /* model-path takes precedence over selected-model/model-elems. An
+   * unrecognized non-empty path fails loudly instead of silently keeping
+   * GCRN's defaults. */
   if (kernel->model_path && kernel->model_path[0] != '\0') {
     if (gst_dsp_kernel_detect_model_from_path (kernel->model_path,
             &kernel->selected_model, &kernel->model_elems)) {
-      g_print ("[DSP] Detected model from model-path '%s': selected-model=%u, "
-          "model-elems=%u\n", kernel->model_path, kernel->selected_model,
+      GST_INFO_OBJECT (kernel,
+          "Detected model from model-path '%s': selected-model=%u, "
+          "model-elems=%u", kernel->model_path, kernel->selected_model,
           kernel->model_elems);
     } else {
       GST_ERROR_OBJECT (kernel,
@@ -401,70 +390,60 @@ gst_dsp_kernel_calculate_buffer_sizes (GstDspKernel * kernel)
   }
 
   if (kernel->model_elems == 0 && kernel->fft_size == 0) {
-    g_print ("[DSP] WARNING: fft_size is 0, cannot calculate buffer sizes\n");
+    GST_WARNING_OBJECT (kernel, "fft_size is 0, cannot calculate buffer sizes");
     return TRUE;
   }
 
   guint model_elems = gst_dsp_kernel_get_model_elems (kernel);
 
-  g_print ("[DSP] Auto-calculating buffer sizes: model_elems=%u (%s)\n",
+  GST_INFO_OBJECT (kernel, "Auto-calculating buffer sizes: model_elems=%u (%s)",
       model_elems, kernel->model_elems > 0 ? "explicit" : "from fft-size");
 
   switch (kernel->msg_type) {
     case DSP_OP_STFT:
-      /* STFT: input is audio (int16), output is spectral (float)
-       * Input buffer:  window_frames * hop_size * sizeof(int16_t)
-       * Output buffer: window_frames * model_elems * sizeof(float) */
+      /* STFT: input is audio (int16), output is spectral (float) */
       kernel->input_buf_size =
           kernel->window_frames * kernel->hop_size * sizeof (int16_t);
       kernel->output_buf_size =
           kernel->window_frames * model_elems * sizeof (float);
-      g_print ("[DSP] Auto-calculated STFT buffer sizes:\n");
-      g_print
-          ("[DSP]   input:  %u bytes (window_frames=%u * hop_size=%u * 2)\n",
-          kernel->input_buf_size, kernel->window_frames, kernel->hop_size);
-      g_print
-          ("[DSP]   output: %u bytes (window_frames=%u * model_elems=%u * 4)\n",
-          kernel->output_buf_size, kernel->window_frames, model_elems);
+      GST_INFO_OBJECT (kernel,
+          "Auto-calculated STFT buffer sizes: input=%u bytes "
+          "(window_frames=%u * hop_size=%u * 2), output=%u bytes "
+          "(window_frames=%u * model_elems=%u * 4)", kernel->input_buf_size,
+          kernel->window_frames, kernel->hop_size, kernel->output_buf_size,
+          kernel->window_frames, model_elems);
       break;
 
     case DSP_OP_ISTFT:
-      /* ISTFT: input is spectral (float), output is audio (int16)
-       * Input buffer:  window_frames * model_elems * sizeof(float)
-       * Output buffer: window_frames * hop_size * sizeof(int16_t) */
+      /* ISTFT: input is spectral (float), output is audio (int16) */
       kernel->input_buf_size =
           kernel->window_frames * model_elems * sizeof (float);
       kernel->output_buf_size =
           kernel->window_frames * kernel->hop_size * sizeof (int16_t);
-      g_print ("[DSP] Auto-calculated ISTFT buffer sizes:\n");
-      g_print
-          ("[DSP]   input:  %u bytes (window_frames=%u * model_elems=%u * 4)\n",
-          kernel->input_buf_size, kernel->window_frames, model_elems);
-      g_print
-          ("[DSP]   output: %u bytes (window_frames=%u * hop_size=%u * 2)\n",
-          kernel->output_buf_size, kernel->window_frames, kernel->hop_size);
+      GST_INFO_OBJECT (kernel,
+          "Auto-calculated ISTFT buffer sizes: input=%u bytes "
+          "(window_frames=%u * model_elems=%u * 4), output=%u bytes "
+          "(window_frames=%u * hop_size=%u * 2)", kernel->input_buf_size,
+          kernel->window_frames, model_elems, kernel->output_buf_size,
+          kernel->window_frames, kernel->hop_size);
       break;
 
     case DSP_OP_DEINT_INTERLEAVE:
-      /* Deinterleave/Interleave: both input and output are spectral (float)
-       * Buffer size: window_frames * model_elems * sizeof(float)
-       * Layout differs: interleaved vs separate real/imaginary planes */
+      /* Both input and output are spectral (float); layout differs
+       * (interleaved vs separate real/imaginary planes). */
       kernel->input_buf_size =
           kernel->window_frames * model_elems * sizeof (float);
       kernel->output_buf_size =
           kernel->window_frames * model_elems * sizeof (float);
-      g_print ("[DSP] Auto-calculated Deinterleave/Interleave buffer sizes:\n");
-      g_print
-          ("[DSP]   input:  %u bytes (window_frames=%u * model_elems=%u * 4)\n",
+      GST_INFO_OBJECT (kernel,
+          "Auto-calculated Deinterleave/Interleave buffer sizes: "
+          "input=output=%u bytes (window_frames=%u * model_elems=%u * 4)",
           kernel->input_buf_size, kernel->window_frames, model_elems);
-      g_print
-          ("[DSP]   output: %u bytes (window_frames=%u * model_elems=%u * 4)\n",
-          kernel->output_buf_size, kernel->window_frames, model_elems);
       break;
 
     default:
-      g_print
-          ("[DSP] Unknown operation type 0x%04x, buffer sizes must be provided\n",
+      GST_WARNING_OBJECT (kernel,
+          "Unknown operation type 0x%04x, buffer sizes must be provided",
           kernel->msg_type);
       break;
   }
@@ -525,62 +504,16 @@ gst_dsp_kernel_init (GstDspKernel * kernel)
 {
   gst_base_transform_set_in_place (GST_BASE_TRANSFORM (kernel), TRUE);
 
+  /* GObject instance memory is zero-filled before init() runs, so only
+   * non-zero defaults need setting explicitly here. */
   kernel->rproc_device = g_strdup (DEFAULT_RPROC_DEVICE);
   kernel->rproc_id = DEFAULT_RPROC_ID;
   kernel->remote_ep = DEFAULT_REMOTE_EP;
-  kernel->msg_type = DEFAULT_MSG_TYPE;
-  kernel->msg_resp_type = DEFAULT_MSG_RESP_TYPE;
-  kernel->input_buf_size = DEFAULT_INPUT_BUF_SIZE;
-  kernel->output_buf_size = DEFAULT_OUTPUT_BUF_SIZE;
-  kernel->param2 = DEFAULT_PARAM2;
-  kernel->hop_size = DEFAULT_HOP_SIZE;
-  kernel->fft_size = DEFAULT_FFT_SIZE;
-  kernel->window_frames = DEFAULT_WINDOW_FRAMES;
-  kernel->batch_size = DEFAULT_BATCH_SIZE;
   kernel->selected_model = DEFAULT_SELECTED_MODEL;
-  kernel->model_elems = DEFAULT_MODEL_ELEMS;
   kernel->model_path = g_strdup (DEFAULT_MODEL_PATH);
   kernel->overlap_frames_prop = DEFAULT_OVERLAP_FRAMES;
   kernel->chunking_mode = DEFAULT_CHUNKING_MODE;
-
-  kernel->rpmsg_chan = NULL;
   kernel->sequence_number = 1;
-  kernel->dma_allocated = FALSE;
-
-  /* Overlap-save chunking initialization */
-  kernel->input_buffer = NULL;
-  kernel->input_buffer_size = 0;
-  kernel->input_buffer_capacity = 0;
-
-  /* Overlap-save parameters (will be calculated in start()) */
-  kernel->overlap_frames = 0;
-  kernel->t_frames = 0;
-  kernel->hop_frames = 0;
-  kernel->hop_samples = 0;
-  kernel->chunk_samples = 0;
-
-  kernel->n_chunks = 0;
-  kernel->total_padded_len = 0;
-  kernel->padded_samples_added = 0;
-  kernel->chunking_in_progress = FALSE;
-
-  kernel->eos_received = FALSE;
-
-  /* Chunk collection for overlap-save reconstruction */
-  kernel->collected_audio = NULL;
-  kernel->collected_audio_size = 0;
-  kernel->collected_audio_capacity = 0;
-  kernel->chunks_received = 0;
-
-  /* Chunk count from upstream */
-  kernel->expected_n_chunks = 0;
-  kernel->chunk_buffer_counter = 0;
-
-  /* Chunking will be determined in start() based on window_frames > CHUNKING_THRESHOLD */
-  kernel->enable_chunking = FALSE;
-
-  memset (&kernel->dma_input, 0, sizeof (kernel->dma_input));
-  memset (&kernel->dma_output, 0, sizeof (kernel->dma_output));
 }
 
 static void
@@ -690,9 +623,6 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
 {
   GstDspKernel *kernel = GST_DSP_KERNEL (trans);
 
-  /* Auto-detect operation from element name. Done here rather than in
-   * gst_dsp_kernel_init() because at instance-init time gst-parse hasn't
-   * applied the "name=" property yet, so GST_ELEMENT_NAME() would be NULL. */
   gst_dsp_kernel_auto_detect_operation (kernel);
 
   /* Auto-calculate buffer sizes based on pipeline parameters */
@@ -700,12 +630,8 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
     return FALSE;
   }
 
-  /* Validate that required parameters are set (operation-specific).
-   * fft-size is only needed to derive model_elems via the GCRN formula;
-   * if model_elems is already known (explicit property or model-path
-   * detection, resolved above in calculate_buffer_sizes), fft-size is
-   * irrelevant - the firmware handles its own FFT size internally for
-   * STFT/ISTFT (it's not even part of the stft_istft_msg wire struct). */
+  /* fft-size is only needed to derive model_elems; not required once
+   * model_elems is already known via property or model-path detection. */
   if (kernel->model_elems == 0 && kernel->fft_size == 0) {
     GST_ERROR_OBJECT (kernel,
         "fft-size must be explicitly set in pipeline (> 0), or provide "
@@ -726,38 +652,29 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
     return FALSE;
   }
 
-  /* Chunking mode: explicit chunking-mode property wins; otherwise fall
-   * back to the window_frames-vs-CHUNKING_THRESHOLD heuristic. The
-   * heuristic is a convenience for the three known models, not a rule -
-   * a new model whose window size happens to straddle the threshold but
-   * needs the opposite behavior must set chunking-mode explicitly. */
+  /* Explicit chunking-mode wins; otherwise fall back to the
+   * window_frames-vs-CHUNKING_THRESHOLD heuristic. */
   if (kernel->chunking_mode == 0) {
     kernel->enable_chunking = FALSE;
-    g_print ("[DSP] chunking-mode=0 (forced): plain windowing\n");
+    GST_INFO_OBJECT (kernel, "chunking-mode=0 (forced): plain windowing");
   } else if (kernel->chunking_mode == 1) {
     kernel->enable_chunking = TRUE;
-    g_print ("[DSP] chunking-mode=1 (forced): overlap-save chunking\n");
+    GST_INFO_OBJECT (kernel, "chunking-mode=1 (forced): overlap-save chunking");
   } else if (kernel->window_frames > CHUNKING_THRESHOLD) {
     kernel->enable_chunking = TRUE;
-    g_print ("[DSP] Large window_frames=%u (> %u threshold), "
-        "enabling overlap-save chunking for GCRN-like models\n",
+    GST_INFO_OBJECT (kernel,
+        "window_frames=%u > %u threshold, enabling overlap-save chunking",
         kernel->window_frames, CHUNKING_THRESHOLD);
   } else {
     kernel->enable_chunking = FALSE;
-    g_print ("[DSP] Small window_frames=%u (<= %u threshold), "
-        "chunking disabled for simple models\n",
+    GST_INFO_OBJECT (kernel,
+        "window_frames=%u <= %u threshold, chunking disabled",
         kernel->window_frames, CHUNKING_THRESHOLD);
   }
 
-  g_print ("TI DSP Kernel Element\n");
-  g_print ("=====================\n");
-  g_print ("[DSP] msg-type: 0x%04x ", kernel->msg_type);
   switch (kernel->msg_type) {
     case DSP_OP_STFT:
-      g_print ("(STFT)\n");
       if (kernel->enable_chunking) {
-        g_print ("[DSP] STFT: initializing overlap-save chunking\n");
-
         /* Initialize overlap-save parameters */
         kernel->overlap_frames = kernel->overlap_frames_prop;
         kernel->t_frames = kernel->overlap_frames / 2;
@@ -765,14 +682,11 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
         kernel->hop_samples = kernel->hop_frames * kernel->hop_size;
         kernel->chunk_samples = kernel->window_frames * kernel->hop_size;
 
-        g_print
-            ("[DSP] Overlap-save: OVERLAP=%zu T_FRAMES=%zu HOP_FRAMES=%zu HOP_SAMPLES=%zu\n",
-            kernel->overlap_frames, kernel->t_frames, kernel->hop_frames,
-            kernel->hop_samples);
+        GST_INFO_OBJECT (kernel,
+            "STFT: overlap-save chunking, OVERLAP=%zu T_FRAMES=%zu "
+            "HOP_FRAMES=%zu HOP_SAMPLES=%zu", kernel->overlap_frames,
+            kernel->t_frames, kernel->hop_frames, kernel->hop_samples);
       } else {
-        g_print ("[DSP] STFT: initializing plain windowing (no overlap, "
-            "classification-style models)\n");
-
         /* No overlap-save: consecutive, non-overlapping windows. Reuses
          * dsp_kernel_process_chunks()'s batching/push logic with the
          * overlap-save trim degenerated to a no-op (t_frames=0). */
@@ -782,25 +696,23 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
         kernel->hop_samples = kernel->hop_frames * kernel->hop_size;
         kernel->chunk_samples = kernel->window_frames * kernel->hop_size;
 
-        g_print
-            ("[DSP] Plain windowing: WINDOW_FRAMES=%u HOP_SAMPLES=%zu\n",
+        GST_INFO_OBJECT (kernel,
+            "STFT: plain windowing, WINDOW_FRAMES=%u HOP_SAMPLES=%zu",
             kernel->window_frames, kernel->hop_samples);
       }
       break;
     case DSP_OP_ISTFT:
-      g_print ("(ISTFT)\n");
-      if (kernel->enable_chunking) {
-        g_print
-            ("[DSP] ISTFT: initializing for chunk collection and reconstruction\n");
-      } else {
-        g_print ("[DSP] ISTFT: simple pass-through mode (no chunking)\n");
-      }
+      GST_INFO_OBJECT (kernel, "ISTFT: %s",
+          kernel->enable_chunking ?
+          "initializing for chunk collection and reconstruction" :
+          "simple pass-through mode (no chunking)");
       break;
     case DSP_OP_DEINT_INTERLEAVE:
-      g_print ("(Deinterleave/Interleave, flag=%u)\n", kernel->param2);
+      GST_INFO_OBJECT (kernel, "Deinterleave/Interleave, flag=%u",
+          kernel->param2);
       break;
     default:
-      g_print ("(Unknown)\n");
+      GST_WARNING_OBJECT (kernel, "Unknown msg-type: 0x%04x", kernel->msg_type);
       break;
   }
 
@@ -811,7 +723,8 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
     GST_ERROR_OBJECT (kernel, "Failed to acquire rpmsg channel");
     return FALSE;
   }
-  g_print ("[DSP] RPMsg channel acquired (fd=%d)\n", kernel->rpmsg_chan->fd);
+  GST_INFO_OBJECT (kernel, "RPMsg channel acquired (fd=%d)",
+      kernel->rpmsg_chan->fd);
 
   /* Allocate DMA buffers */
   int r1 = dmabuf_heap_init ((char *) "linux,cma", kernel->input_buf_size,
@@ -830,47 +743,38 @@ gst_dsp_kernel_start (GstBaseTransform * trans)
 
   kernel->dma_allocated = TRUE;
 
-  /* Print comprehensive DMA buffer summary similar to C application */
-  g_print ("\n");
-  g_print ("========== [DSP Kernel] Initialization Summary ==========\n");
-  g_print ("[DSP] Configuration:\n");
-  g_print ("[DSP]   msg-type: 0x%04x (%s)\n", kernel->msg_type,
-      kernel->msg_type == 0x1020 ? "STFT" :
-      kernel->msg_type == 0x1030 ? "ISTFT" :
-      kernel->msg_type == 0x1040 ? "Deinterleave/Interleave" : "Unknown");
-  g_print ("[DSP]   hop-size: %u samples\n", kernel->hop_size);
-  g_print ("[DSP]   fft-size: %u\n", kernel->fft_size);
-  g_print ("[DSP]   window-frames: %u\n", kernel->window_frames);
-  g_print ("[DSP]   batch-size: %u\n", kernel->batch_size);
-  g_print ("[DSP]   selected-model: %u\n", kernel->selected_model);
   {
     const gchar *model_elems_source;
 
     if (kernel->model_path && kernel->model_path[0]) {
-      model_elems_source = " (from model-path)";
+      model_elems_source = "from model-path";
     } else if (kernel->model_elems > 0) {
-      model_elems_source = " (explicit)";
+      model_elems_source = "explicit";
     } else {
-      model_elems_source = " (auto, from fft-size)";
+      model_elems_source = "auto, from fft-size";
     }
-    g_print ("[DSP]   model-elems: %u%s\n", kernel->model_elems,
-        model_elems_source);
+
+    GST_INFO_OBJECT (kernel,
+        "Initialization summary: msg-type=0x%04x hop-size=%u fft-size=%u "
+        "window-frames=%u batch-size=%u selected-model=%u model-elems=%u "
+        "(%s)%s%s", kernel->msg_type, kernel->hop_size, kernel->fft_size,
+        kernel->window_frames, kernel->batch_size, kernel->selected_model,
+        kernel->model_elems, model_elems_source,
+        (kernel->model_path && kernel->model_path[0]) ? " model-path=" : "",
+        (kernel->model_path && kernel->model_path[0]) ?
+        kernel->model_path : "");
   }
-  if (kernel->model_path && kernel->model_path[0]) {
-    g_print ("[DSP]   model-path: %s\n", kernel->model_path);
+  GST_INFO_OBJECT (kernel,
+      "DMA buffers: input=%u bytes @ phys=0x%08lx, output=%u bytes @ "
+      "phys=0x%08lx", kernel->input_buf_size,
+      (unsigned long) kernel->dma_input.phys_addr, kernel->output_buf_size,
+      (unsigned long) kernel->dma_output.phys_addr);
+  if (kernel->enable_chunking && kernel->msg_type == DSP_OP_STFT) {
+    GST_INFO_OBJECT (kernel,
+        "Overlap-save chunking: overlap_frames=%zu hop_frames=%zu "
+        "chunk_samples=%zu", kernel->overlap_frames, kernel->hop_frames,
+        kernel->chunk_samples);
   }
-  g_print ("[DSP] DMA buffers allocated:\n");
-  g_print ("[DSP]   input:  %u bytes @ phys=0x%08lx\n",
-      kernel->input_buf_size, (unsigned long) kernel->dma_input.phys_addr);
-  g_print ("[DSP]   output: %u bytes @ phys=0x%08lx\n",
-      kernel->output_buf_size, (unsigned long) kernel->dma_output.phys_addr);
-  if (kernel->enable_chunking && kernel->msg_type == 0x1020) {
-    g_print ("[DSP] Overlap-save chunking enabled:\n");
-    g_print ("[DSP]   overlap_frames: %zu\n", kernel->overlap_frames);
-    g_print ("[DSP]   hop_frames: %zu\n", kernel->hop_frames);
-    g_print ("[DSP]   chunk_samples: %zu\n", kernel->chunk_samples);
-  }
-  g_print ("=========================================================\n\n");
 
   return TRUE;
 }
@@ -987,18 +891,8 @@ dsp_kernel_send_recv_deint (GstDspKernel * kernel,
   return GST_FLOW_OK;
 }
 
-/* Process exactly one already-complete window of window_frames*hop_size
- * audio samples immediately, batching it through the DSP the same way
- * dsp_kernel_process_chunks() does, and pushing the resulting spectral
- * buffer downstream right away. Used for live/streaming classification
- * sources (e.g. a microphone) where EOS never arrives, so waiting for
- * end-of-stream to process anything (like the GCRN overlap-save path
- * does) would mean never producing output at all.
- *
- * GST_BUFFER_OFFSET chunk metadata is intentionally left unset here -
- * the total window count is unknown for an open-ended live stream;
- * downstream (titvm) already falls back to a plain running counter
- * when no offset is present. */
+/* Process one complete window immediately and push it downstream, for
+ * live/streaming sources (e.g. a microphone) that never send EOS. */
 static GstFlowReturn
 dsp_kernel_process_stream_window (GstDspKernel * kernel,
     GstBaseTransform * trans, const gint16 * window_audio)
@@ -1071,13 +965,9 @@ dsp_kernel_process_stream_window (GstDspKernel * kernel,
   return push_ret;
 }
 
-/* STFT transform: always accumulate incoming audio. For overlap-save
- * chunking (GCRN-like enhancement models), the actual DSP work happens at
- * EOS in dsp_kernel_process_chunks(). For plain non-overlapping windowing
- * (classification-style models, see gst_dsp_kernel_start()), each complete
- * window is instead processed immediately as it becomes available, so
- * live sources (e.g. a microphone, which never sends EOS) produce output
- * in real time rather than only once the pipeline stops. */
+/* STFT transform: accumulate audio. Overlap-save models process at EOS
+ * via dsp_kernel_process_chunks(); plain-windowing models process each
+ * complete window immediately via dsp_kernel_process_stream_window(). */
 static GstFlowReturn
 dsp_kernel_transform_stft (GstDspKernel * kernel, GstBaseTransform * trans,
     GstBuffer * buf)
@@ -1257,8 +1147,7 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
     GST_INFO_OBJECT (kernel,
         "ISTFT: Chunk mode detected (n_chunks=%zu). Will apply overlap-save trimming.",
         n_chunks);
-    /* Apply overlap-save trimming: keep different regions for each chunk
-     * Formula from C reference app:
+    /* Apply overlap-save trimming: keep different regions for each chunk.
      *   lo_sample = (chunk_idx == 0) ? 0 : T_SAMPLES;
      *   hi_sample = (chunk_idx == n_chunks - 1) ? CHUNK_SAMPLES : CHUNK_SAMPLES - T_SAMPLES;
      *   keep [lo_sample : hi_sample]
@@ -1314,8 +1203,8 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
     }
   }
 
-  /* Note: Padded samples will be trimmed from the FINAL total after all chunks collected,
-   * not from individual chunks. This matches the C reference app's approach. */
+  /* Padded samples are trimmed from the FINAL total after all chunks are
+   * collected, not from individual chunks. */
 
   /* If in chunk mode (n_chunks > 1), collect trimmed audio instead of outputting immediately */
   if (n_chunks > 1) {
@@ -1376,7 +1265,7 @@ dsp_kernel_transform_istft (GstDspKernel * kernel, GstBuffer * buf)
           "ISTFT: FINAL OUTPUT: Combining all chunks with total %zu samples before padding trim",
           kernel->collected_audio_size);
 
-      /* Trim final padding from the total collected audio (matches C reference app) */
+      /* Trim final padding from the total collected audio */
       gsize final_samples = kernel->collected_audio_size;
       if (kernel->padded_samples_added > 0
           && final_samples >= kernel->padded_samples_added) {
@@ -1580,9 +1469,8 @@ dsp_kernel_transform_deint_interleave (GstDspKernel * kernel, GstBuffer * buf)
   return GST_FLOW_OK;
 }
 
-/* Helper: Process all chunks with overlap-save
- * Each chunk outputs FULL spectral data (WINDOW_FRAMES spectral frames)
- * Trimming of audio output happens in ISTFT or downstream, not here */
+/* Process all chunks with overlap-save; each chunk outputs full spectral
+ * data, trimming happens downstream in ISTFT. */
 static GstFlowReturn
 dsp_kernel_process_chunks (GstDspKernel * kernel, GstBaseTransform * trans)
 {

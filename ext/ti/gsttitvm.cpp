@@ -93,21 +93,16 @@ extern "C"
 using namespace
     tvm::runtime;
 
-/*
- * tvm-model-daemon protocol (mirrors include/tvm_daemon_proto.h from the
- * rpmsg-dma-pd edge-ai example app). The DSP compute channel only supports
- * one client at a time; on boards running tvm-model-daemon.service, that
- * daemon already owns the c7x_compute session, so titvm must reuse it
- * over this socket rather than loading the model in-process.
- */
+/* tvm-model-daemon: a persistent Unix-socket service that holds the C7x
+ * compute session, since that DSP channel only supports one client at a
+ * time. titvm talks to it over this socket rather than loading the model
+ * in-process whenever the daemon is available. */
 #define TVM_DAEMON_SOCKET_PATH "/var/run/tvm-inference.sock"
 #define TVM_DAEMON_MAGIC       0x544D5644u      /* 'TMVD' */
 
-/* tvm-model-daemon persistently holds exactly one loaded model (the DSP
- * compute channel only supports one client). This is the same cache file
- * the reference rpmsg-dma-pd app's pipeline_manager uses to detect a
- * model switch and restart the daemon - see gst_ti_tvm_ensure_daemon_model
- * below, which mirrors that logic. */
+/* The daemon holds exactly one loaded model at a time; this cache file
+ * records which one, so gst_ti_tvm_ensure_daemon_model() below can detect
+ * a model switch and restart the daemon onto the right one. */
 #define TVM_MODEL_CACHE_FILE "/var/lib/tvm_inference/loaded_model"
 
 enum TvmDaemonMsgType
@@ -410,8 +405,6 @@ gst_ti_tvm_get_property (GObject * object, guint property_id,
 static void
 gst_ti_tvm_dispose (GObject * object)
 {
-  /* Clean up any remaining resources */
-
   G_OBJECT_CLASS (parent_class)->dispose (object);
 }
 
@@ -459,8 +452,6 @@ gst_ti_tvm_start (GstBaseTransform * trans)
   GstTiTvm *tvm = GST_TI_TVM (trans);
 
   GST_DEBUG_OBJECT (tvm, "Starting TI TVM inference element");
-  g_print ("TI TVM Inference Element\n");
-  g_print ("========================\n");
 
   /* Initialize TVM runtime */
   if (!gst_ti_tvm_load_model (tvm)) {
@@ -521,7 +512,6 @@ gst_ti_tvm_stop (GstBaseTransform * trans)
   return TRUE;
 }
 
-/* Caps negotiation */
 static GstCaps *
 gst_ti_tvm_transform_caps (GstBaseTransform * trans, GstPadDirection direction,
     GstCaps * caps, GstCaps * filter)
@@ -540,7 +530,6 @@ gst_ti_tvm_transform_caps (GstBaseTransform * trans, GstPadDirection direction,
   return othercaps;
 }
 
-/* Prepare output buffer with correct size */
 static GstFlowReturn
 gst_ti_tvm_prepare_output_buffer (GstBaseTransform * trans, GstBuffer * inbuf,
     GstBuffer ** outbuf)
@@ -563,7 +552,6 @@ gst_ti_tvm_prepare_output_buffer (GstBaseTransform * trans, GstBuffer * inbuf,
         output_size);
   }
 
-  /* Allocate output buffer with correct size */
   *outbuf = gst_buffer_new_allocate (NULL, output_size, NULL);
   if (!*outbuf) {
     GST_ERROR_OBJECT (tvm, "Failed to allocate output buffer of size %zu",
@@ -588,7 +576,6 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   GstMapInfo in_map, out_map;
   GstFlowReturn ret;
 
-  /* Map input buffer */
   if (!gst_buffer_map (inbuf, &in_map, GST_MAP_READ)) {
     GST_ERROR_OBJECT (tvm, "Failed to map input buffer");
     return GST_FLOW_ERROR;
@@ -620,15 +607,12 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   }
 
 
-  /* Run inference benchmark */
   ret = gst_ti_tvm_run_inference (tvm, input_data, input_size);
 
-  /* Copy inference output to output buffer */
   if (ret == GST_FLOW_OK && tvm->output_num_floats > 0 &&
       (tvm->daemon_fd >= 0 || tvm->final_output)) {
     gsize out_bytes = tvm->output_num_floats * sizeof (float);
 
-    /* Map output buffer (write-only) */
     if (!gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE)) {
       GST_ERROR_OBJECT (tvm, "Failed to map output buffer");
       gst_buffer_unmap (inbuf, &in_map);
@@ -651,7 +635,6 @@ gst_ti_tvm_transform (GstBaseTransform * trans, GstBuffer * inbuf,
 
     gst_buffer_unmap (outbuf, &out_map);
 
-    /* Set actual output size */
     gst_buffer_set_size (outbuf, (gssize) out_bytes);
   }
 
@@ -703,10 +686,7 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
       GST_INFO_OBJECT (tvm, "[TVM] Shape auto-detection: SUCCESS");
     } else {
       GST_WARNING_OBJECT (tvm,
-          "[TVM] Shape auto-detection: FAILED (will require input-shape property)");
-      g_print ("[TVM Model Shape Detection]\n");
-      g_print
-          ("  Shape auto-detection FAILED - will use property or 1D shape\n");
+          "[TVM] Shape auto-detection FAILED - will use property or 1D shape");
     }
 
     g_free (graph_path);
@@ -733,7 +713,6 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
     gchar *param_path =
         g_strdup_printf ("%s/deploy_param.params", tvm->model_path);
 
-    /* Load TVM artifacts */
     Module lib = Module::LoadFromFile (lib_path);
 
     auto graph_executor_create = Registry::Get ("tvm.graph_executor.create");
@@ -759,7 +738,6 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
       return FALSE;
     }
 
-    /* Load parameters */
     gsize param_size;
     gchar *param_data = gst_ti_tvm_load_param_file (param_path, &param_size);
     if (!param_data) {
@@ -806,10 +784,8 @@ gst_ti_tvm_load_model (GstTiTvm * tvm)
   }
 }
 
-/* Read/write exactly size bytes, looping over short reads/writes (a
- * Unix stream socket may legitimately transfer less than requested in
- * a single call, e.g. for buffers larger than the socket's buffer size).
- * Returns FALSE on EOF/error before size bytes were transferred. */
+/* Read exactly size bytes, looping over short reads (a Unix stream socket
+ * may transfer less than requested in one call). Returns FALSE on EOF/error. */
 static gboolean
 gst_ti_tvm_daemon_read_full (gint fd, gpointer buf, gsize size)
 {
@@ -856,14 +832,11 @@ gst_ti_tvm_normalize_path (const gchar * path)
   return copy;
 }
 
-/* Mirrors pipeline_manager.cpp's model-switch logic in the reference
- * rpmsg-dma-pd app: tvm-model-daemon persistently holds exactly one
- * loaded model (the DSP compute channel only supports one client). If
- * the cached path doesn't match model-path, write the new path and
- * restart the daemon, then poll for its socket to reappear before
- * returning - otherwise gst_ti_tvm_daemon_connect() below would happily
- * connect to a daemon serving the *wrong* model, and every inference
- * request would fail with a shape/element-count mismatch. */
+/* If the daemon's cached model doesn't match model-path, write the new
+ * path, restart the daemon, and poll for its socket to reappear -
+ * otherwise gst_ti_tvm_daemon_connect() below would connect to a daemon
+ * serving the wrong model, and every inference request would fail with
+ * a shape/element-count mismatch. */
 static void
 gst_ti_tvm_ensure_daemon_model (GstTiTvm * tvm)
 {
@@ -884,8 +857,6 @@ gst_ti_tvm_ensure_daemon_model (GstTiTvm * tvm)
     return;
   }
 
-  GST_INFO_OBJECT (tvm, "[TVM] Model cache mismatch, switching daemon to: %s",
-      wanted);
   g_print ("[TVM] Model changed, restarting tvm-model-daemon for: %s\n",
       wanted);
 
@@ -905,7 +876,6 @@ gst_ti_tvm_ensure_daemon_model (GstTiTvm * tvm)
   for (i = 0; i < 60; i++) {
     g_usleep (G_USEC_PER_SEC);
     if (g_file_test (TVM_DAEMON_SOCKET_PATH, G_FILE_TEST_EXISTS)) {
-      GST_INFO_OBJECT (tvm, "[TVM] Daemon ready");
       g_print ("[TVM] Daemon ready.\n");
       break;
     }
@@ -1092,7 +1062,6 @@ gst_ti_tvm_run_inference (GstTiTvm * tvm, gfloat * input_data, gsize input_size)
           input_size);
     }
 
-    /* Create input NDArray */
     NDArray input_array = NDArray::Empty (shape, DLDataType {
           kDLFloat, 32, 1
         }, DLDevice {
@@ -1101,7 +1070,6 @@ gst_ti_tvm_run_inference (GstTiTvm * tvm, gfloat * input_data, gsize input_size)
     );
     input_array.CopyFromBytes (input_data, input_size * sizeof (float));
 
-    /* Run single inference */
     auto start_time = std::chrono::high_resolution_clock::now ();
 
     (*set_input) (0, input_array);
@@ -1116,7 +1084,6 @@ gst_ti_tvm_run_inference (GstTiTvm * tvm, gfloat * input_data, gsize input_size)
 
     tvm->perf_data.first_run_time = duration.count ();
 
-    /* Get output shape */
     gsize out_floats = 1;
     for (int j = 0; j < output_array->ndim; j++) {
       out_floats *= output_array->shape[j];
@@ -1184,13 +1151,11 @@ gst_ti_tvm_parse_shape_from_json (GstTiTvm * tvm, const gchar * graph_json,
     }
   }
 
-  /* Get attrs object */
   if (!json_object_object_get_ex (root_obj, "attrs", &attrs_obj)) {
     GST_WARNING_OBJECT (tvm, "JSON missing 'attrs' field");
     goto cleanup;
   }
 
-  /* Get shape array */
   if (!json_object_object_get_ex (attrs_obj, "shape", &shape_array)) {
     GST_WARNING_OBJECT (tvm, "JSON missing 'attrs.shape' field");
     goto cleanup;
@@ -1215,7 +1180,6 @@ gst_ti_tvm_parse_shape_from_json (GstTiTvm * tvm, const gchar * graph_json,
     goto cleanup;
   }
 
-  /* Parse input shape (first element) */
   input_shape_array = json_object_array_get_idx (shapes, 0);
   if (input_shape_array) {
     size_t input_shape_len = json_object_array_length (input_shape_array);
@@ -1227,7 +1191,6 @@ gst_ti_tvm_parse_shape_from_json (GstTiTvm * tvm, const gchar * graph_json,
     }
   }
 
-  /* Parse output shape (second element) */
   output_shape_array = json_object_array_get_idx (shapes, 1);
   if (output_shape_array) {
     size_t output_shape_len = json_object_array_length (output_shape_array);
@@ -1291,22 +1254,9 @@ gst_ti_tvm_load_param_file (const gchar * file_path, gsize * file_size)
   return contents;
 }
 
-/* Parse an ordered list of class names out of either:
- *  - a YAML file shaped like yamnet_class_map.yml:
- *      - id: /m/09x0r
- *        name: Speech
- *    (only the "name:" scalar on each entry is needed, in file order,
- *    which is the class index order the model output uses - avoids
- *    pulling in a full YAML parser for this one flat, non-nested
- *    structure), or
- *  - a plain newline-separated list like vggish_label_list.txt:
- *      Air conditioner
- *      Car horn
- *      ...
- * The two are told apart by whether any "name:" line is found; if not,
- * every non-empty line is treated as a class name directly.
- * No-op (leaves class_names NULL) when class_map_path is unset, so
- * printing stays disabled by default for non-classification models. */
+/* Parse an ordered list of class names from either a YAML file with
+ * "name:" scalars (in file order = model output class index) or a plain
+ * newline-separated list. No-op when class_map_path is unset. */
 static void
 gst_ti_tvm_load_class_map (GstTiTvm * tvm)
 {
@@ -1359,8 +1309,6 @@ gst_ti_tvm_load_class_map (GstTiTvm * tvm)
   tvm->num_class_names = names->len;
   tvm->class_names = (gchar **) g_ptr_array_free (names, FALSE);
 
-  GST_INFO_OBJECT (tvm, "[TVM] Loaded %u class names from %s",
-      tvm->num_class_names, tvm->class_map_path);
   g_print
       ("[TVM] Live top-%u prediction printing enabled (%u classes from %s)\n",
       tvm->top_k, tvm->num_class_names, tvm->class_map_path);
