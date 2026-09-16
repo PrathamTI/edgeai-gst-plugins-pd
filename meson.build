@@ -81,6 +81,11 @@ if get_option('tvm-plugins').enabled() and SOC != 'am62d'
   error('MESON_FAIL tvm-plugins is only supported on am62d (got SOC=', SOC, ')')
 endif
 
+# stft-plugins is only supported on am62d
+if get_option('stft-plugins').enabled() and SOC != 'am62d'
+  error('MESON_FAIL stft-plugins is only supported on am62d (got SOC=', SOC, ')')
+endif
+
 if get_option('tvm-plugins').enabled()
   tvm_pkgconfig_dep = dependency('tvm', required : false, method : 'pkg-config')
 
